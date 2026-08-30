@@ -348,18 +348,17 @@ namespace SevenBoldPencil.TargetDummies
 				catch { return null; }
 			}
 
-			// PORTING NOTE (SPT 4.0.13): confirmed in-game - trying candidates one at a time and
-			// stopping at the first whose LoadBundlesAsync call reports overall Succeed==true is
-			// NOT enough. That call still reported success while at least one specific bundle
-			// (a randomized "wild_head_N.bundle" scav head variant) silently never resolved,
-			// because a batch load can succeed overall even if individual malformed names in it are
-			// just skipped rather than causing a failure. LocalPlayer.Create then threw "wild_head_N
-			// is not loaded" mid-construction, leaving a bodyless bot with only gear attached.
-			// Loading the UNION of every candidate's converted names in one call - rather than
-			// racing candidates and stopping at the first that "works" - means whichever format a
-			// given resource key actually needs still gets tried.
+			// PORTING NOTE (SPT 4.0.13): confirmed via the game's own errors.log - unioning
+			// ToAssetName()/rcid/path together (a previous attempt at this method) was actively
+			// harmful. ToAssetName() produces the correct, well-formed name the server actually
+			// serves (matches the exact "<name>.bundle is not loaded" text LocalPlayer.Create
+			// throws when a bundle genuinely isn't ready yet). rcid and path instead produce a
+			// backslash-mixed, non-".bundle"-suffixed string for these character/gear keys, and
+			// EVERY SINGLE bundle in the batch got an HTTP 404 once those malformed names were
+			// mixed into the same LoadBundlesAsync call - not just the one asset they were meant
+			// for. ToAssetName() alone is both correct and sufficient.
 			var bundleNames = resourceKeys
-				.SelectMany(key => new[] { SafeToAssetName(key), key.rcid, key.path })
+				.Select(SafeToAssetName)
 				.Where(name => !string.IsNullOrEmpty(name))
 				.Distinct()
 				.ToArray();
