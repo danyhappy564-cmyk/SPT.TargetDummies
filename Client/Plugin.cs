@@ -163,20 +163,17 @@ namespace SevenBoldPencil.TargetDummies
 
 			var botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile_0, data.Type.Value);
 
-			// PORTING NOTE (SPT 4.0.13): confirmed by spt-hideout-shootout's own backport - the
-			// hands-rig bundle (assets/content/hands/*.bundle) is never loadable outside a real
-			// raid's own loading screen, regardless of which bundle-loading API is used beforehand.
-			// PlayerBody.Init throws "X is not loaded. You should load it first." for it every time.
-			// Stripping the Hands customization entry here means the mannequin spawns bare-handed
-			// instead of not spawning at all - same trade-off spt-hideout-shootout made.
-			try
-			{
-				botPlayerProfile.Customization?.Remove(EBodyModelPart.Hands);
-			}
-			catch (Exception ex)
-			{
-				Logger.LogWarning($"Could not strip EBodyModelPart.Hands from mannequin profile {botPlayerProfile?.Id}'s customization: {ex.Message}");
-			}
+			// PORTING NOTE (SPT 4.0.13): a prior version of this port stripped EBodyModelPart.Hands
+			// from the profile's Customization here, copying a fix from spt-hideout-shootout's own
+			// backport (there, the hands-rig bundle is never loadable outside a real raid's loading
+			// screen). Confirmed WRONG for this mod: Profile.GetAllPrefabPaths iterates all
+			// EBodyModelPart values and indexes Customization[part] directly, so removing an entry
+			// throws KeyNotFoundException instead of skipping it - the exact opposite of the
+			// intended effect. TargetDummies also mostly spawns real WildSpawnType bot profiles
+			// fetched via session.LoadBots (not hand-built ones like hideout-shootout's scav
+			// target), which should carry a legitimately loadable Hands entry already. Removed;
+			// if hands still fail to load in-game, that will show as a bundle-load
+			// warning/timeout from PreloadProfileBundlesAsync below, not a hard crash.
 
 			// PORTING NOTE (SPT 4.0.13): ObjectsFactory.LoadBundlesAndCreatePools (4.1's name for
 			// this singleton/method pair) doesn't exist under that name here - PoolManagerClass is
