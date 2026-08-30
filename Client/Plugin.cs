@@ -481,23 +481,10 @@ namespace SevenBoldPencil.TargetDummies
 			// PORTING NOTE (SPT 4.0.13): order matters here, and getting it wrong is what left
 			// weapons hanging in mid-air. The Corpse owns the dead mannequin's body, so destroying
 			// it first tore that body down and the following Dispose() then threw
-			// NullReferenceException - once per despawn, confirmed in-game - which meant
-			// ReturnToPool never ran and the held weapon was never cleaned up. Identify the corpse
-			// first, dispose the player, and only then destroy the corpse.
-			string profileId = null;
-			Vector3? position = null;
-			try
-			{
-				profileId = bot.ProfileId;
-				if (bot.Transform != null)
-				{
-					position = bot.Transform.position;
-				}
-			}
-			catch (Exception ex)
-			{
-				DebugLog($"Could not read a mannequin's identity before despawning it: {ex.GetType().Name}: {ex.Message}");
-			}
+			// NullReferenceException - once per despawn, confirmed in-game - which meant the pooling
+			// step never ran and the held weapon was never cleaned up. So: find the corpse first,
+			// dispose the player, and only then destroy the corpse.
+			Corpse corpse = FindCorpseOf(bot);
 
 			try
 			{
@@ -525,7 +512,7 @@ namespace SevenBoldPencil.TargetDummies
 				Logger.LogWarning($"Could not destroy a mannequin's body: {ex.GetType().Name}: {ex.Message}");
 			}
 
-			DestroyCorpse(profileId, position);
+			DestroyCorpse(corpse);
 		}
 
 		/// <summary>Destroys every corpse in the hideout - all of them are mannequins.</summary>
@@ -550,89 +537,87 @@ namespace SevenBoldPencil.TargetDummies
 			}
 		}
 
-		/// <summary>Destroys the corpse loot item a dead mannequin left in the world, if any.</summary>
-		private void DestroyCorpse(string profileId, Vector3? position)
+		/// <summary>
+		/// Finds the corpse belonging to a mannequin, by object identity.
+		/// </summary>
+		/// <remarks>
+		/// PORTING NOTE (SPT 4.0.13): this used to fall back to matching by position, and that was
+		/// wrong. A ragdoll slides and gets shoved around as it falls, so by the time the body is
+		/// cleaned up it is no longer where the mannequin stood - the match missed, the corpse
+		/// survived, and the next mannequin spawned inside it. Widening the radius is not a fix
+		/// either: the two closest slots are only 2.19m apart, so a radius large enough to survive a
+		/// ragdoll sliding is also large enough to delete the neighbour's body.
+		///
+		/// A corpse is built from the dead player's own body object, so hierarchy identity settles
+		/// it exactly and cannot drift. Profile id is tried first where the corpse exposes one.
+		/// There is deliberately no distance fallback: when nothing matches, nothing is destroyed.
+		/// </remarks>
+		private Corpse FindCorpseOf(LocalPlayer bot)
 		{
 			try
 			{
 				var gameWorld = Singleton<GameWorld>.Instance;
-				if (gameWorld?.LootList == null)
+				if (gameWorld?.LootList == null || bot == null)
 				{
-					return;
+					return null;
 				}
+
+				string profileId = bot.ProfileId;
+				Transform botRoot = bot.gameObject != null ? bot.gameObject.transform : null;
 
 				foreach (var corpse in gameWorld.LootList.OfType<Corpse>().ToArray())
 				{
-					if (!CorpseBelongsTo(corpse, profileId, position))
+					if (corpse == null)
 					{
 						continue;
 					}
 
-					DebugLog($"Destroying the corpse left by mannequin {profileId}.");
-					gameWorld.DestroyLoot(corpse);
+					if (CorpseHasProfileId(corpse, profileId) || SharesHierarchy(corpse, botRoot))
+					{
+						return corpse;
+					}
 				}
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning($"Could not clean up a mannequin's corpse: {ex.GetType().Name}: {ex.Message}");
+				Logger.LogWarning($"Could not find a mannequin's corpse: {ex.GetType().Name}: {ex.Message}");
 			}
+
+			return null;
 		}
 
-		/// <summary>
-		/// Matches a corpse to the mannequin that produced it - by profile id where the corpse
-		/// exposes one, otherwise by position, since mannequins occupy fixed, well separated slots.
-		/// </summary>
-		private static bool CorpseBelongsTo(Corpse corpse, string profileId, Vector3? position)
+		/// <summary>Destroys a corpse previously found by <see cref="FindCorpseOf"/>.</summary>
+		private void DestroyCorpse(Corpse corpse)
 		{
 			if (corpse == null)
 			{
-				return false;
+				return;
 			}
 
-			if (!string.IsNullOrEmpty(profileId))
+			try
 			{
-				foreach (var member in corpse.GetType().GetMembers(BindingFlags.Public | BindingFlags.Instance))
-				{
-					object value = null;
-					try
-					{
-						value = (member as PropertyInfo)?.GetValue(corpse)
-							?? (member as FieldInfo)?.GetValue(corpse);
-					}
-					catch { }
-
-					if (value == null || value is string)
-					{
-						continue;
-					}
-
-					string candidate = null;
-					try
-					{
-						candidate = value.GetType().GetProperty("ProfileId", BindingFlags.Public | BindingFlags.Instance)
-							?.GetValue(value) as string;
-					}
-					catch { }
-
-					if (string.Equals(candidate, profileId, StringComparison.Ordinal))
-					{
-						return true;
-					}
-				}
+				DebugLog("Destroying a mannequin's corpse.");
+				Singleton<GameWorld>.Instance?.DestroyLoot(corpse);
 			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not destroy a mannequin's corpse: {ex.GetType().Name}: {ex.Message}");
+			}
+		}
 
-			// Fallback: the corpse dropped where the mannequin stood. The two closest slots are
-			// 2.19m apart, so keep this well inside that - 1m - or one mannequin's despawn starts
-			// destroying its neighbour's body.
-			if (position == null)
+		/// <summary>True if the corpse's object is the mannequin's body, or sits inside it.</summary>
+		private static bool SharesHierarchy(Corpse corpse, Transform botRoot)
+		{
+			if (botRoot == null)
 			{
 				return false;
 			}
 
 			try
 			{
-				return corpse.transform != null
-					&& (corpse.transform.position - position.Value).sqrMagnitude <= 1f;
+				Transform corpseTransform = corpse.transform;
+				return corpseTransform != null
+					&& (corpseTransform.IsChildOf(botRoot) || botRoot.IsChildOf(corpseTransform));
 			}
 			catch
 			{
@@ -640,366 +625,44 @@ namespace SevenBoldPencil.TargetDummies
 			}
 		}
 
-		/// <summary>
-		/// Puts a spawned mannequin into the configured stance.
-		/// </summary>
-		/// <remarks>
-		/// Reflection-based: MovementContext's pose members are obfuscated differently between
-		/// builds, so each candidate is probed by name and a miss degrades to a debug line rather
-		/// than breaking the build or throwing into the spawn path.
-		/// </remarks>
-		private void ApplyPose(LocalPlayer botPlayer, MannequinPose pose)
+		/// <summary>True if anything the corpse exposes carries this profile id.</summary>
+		private static bool CorpseHasProfileId(Corpse corpse, string profileId)
 		{
-			try
+			if (string.IsNullOrEmpty(profileId))
 			{
-				var movementContext = botPlayer.GetType()
-					.GetProperty("MovementContext", BindingFlags.Public | BindingFlags.Instance)
-					?.GetValue(botPlayer);
-
-				if (movementContext == null)
-				{
-					DebugLog("Player.MovementContext was not found; mannequin pose left as spawned.");
-					return;
-				}
-
-				var contextType = movementContext.GetType();
-
-				if (pose == MannequinPose.Prone)
-				{
-					// Prone is a separate state from the standing/crouching pose level.
-					var setProne = contextType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-						.FirstOrDefault(m => (m.Name == "SetProne" || m.Name == "TryProne")
-							&& m.GetParameters().Length <= 1);
-
-					if (setProne != null)
-					{
-						var args = setProne.GetParameters().Length == 1 ? new object[] { true } : Array.Empty<object>();
-						setProne.Invoke(movementContext, args);
-						return;
-					}
-
-					var proneFlag = contextType.GetProperty("IsInPronePose", BindingFlags.Public | BindingFlags.Instance);
-					if (proneFlag != null && proneFlag.CanWrite)
-					{
-						proneFlag.SetValue(movementContext, true);
-						return;
-					}
-
-					DebugLog("No prone member found on MovementContext; mannequin left standing.");
-					return;
-				}
-
-				// 1 is fully upright, 0 is fully crouched.
-				float poseLevel = pose == MannequinPose.Crouching ? 0f : 1f;
-
-				var setPoseLevel = contextType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-					.FirstOrDefault(m => m.Name == "SetPoseLevel"
-						&& m.GetParameters().Length >= 1
-						&& m.GetParameters()[0].ParameterType == typeof(float));
-
-				if (setPoseLevel != null)
-				{
-					var parameters = setPoseLevel.GetParameters();
-					var args = new object[parameters.Length];
-					args[0] = poseLevel;
-					for (int i = 1; i < parameters.Length; i++)
-					{
-						args[i] = parameters[i].HasDefaultValue ? parameters[i].DefaultValue : (object)true;
-					}
-
-					setPoseLevel.Invoke(movementContext, args);
-					return;
-				}
-
-				var poseProperty = contextType.GetProperty("PoseLevel", BindingFlags.Public | BindingFlags.Instance);
-				if (poseProperty != null && poseProperty.CanWrite)
-				{
-					poseProperty.SetValue(movementContext, poseLevel);
-					return;
-				}
-
-				DebugLog("No pose-level member found on MovementContext; mannequin pose left as spawned.");
-			}
-			catch (Exception ex)
-			{
-				DebugLog($"Could not set mannequin pose to {pose}: {ex.GetType().Name}: {ex.Message}");
-			}
-		}
-
-		/// <summary>
-		/// Gives a bot an empty-hands controller, so that MovementContext/MouseLook has the state it
-		/// dereferences every frame. Reflection-based: the callback parameter's exact type is not
-		/// confirmed for this obfuscated build, and a null callback is accepted either way.
-		/// </summary>
-		private void TrySetEmptyHands(LocalPlayer botPlayer)
-		{
-			try
-			{
-				var method = botPlayer.GetType()
-					.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-					.FirstOrDefault(m => m.Name == "SetEmptyHands" && m.GetParameters().Length == 1);
-
-				if (method == null)
-				{
-					Logger.LogWarning("LocalPlayer has no single-argument SetEmptyHands; the mannequin may log a MouseLook NullReferenceException every frame.");
-					return;
-				}
-
-				method.Invoke(botPlayer, new object[] { null });
-			}
-			catch (Exception ex)
-			{
-				Logger.LogWarning($"SetEmptyHands failed: {ex.GetType().Name}: {ex.Message}");
-			}
-		}
-
-		/// <summary>
-		/// Destroys any <see cref="Player"/> that appeared since <paramref name="playersBeforeCreate"/>
-		/// was captured. Called only when <c>LocalPlayer.Create</c> threw, to clean up the
-		/// half-constructed body it left in the scene - see the porting note at the snapshot site.
-		/// </summary>
-		private void DestroyOrphanedPlayers(HashSet<LocalPlayer> playersBeforeCreate)
-		{
-			if (playersBeforeCreate == null)
-			{
-				return;
+				return false;
 			}
 
-			try
+			foreach (var member in corpse.GetType().GetMembers(BindingFlags.Public | BindingFlags.Instance))
 			{
-				foreach (var player in UnityEngine.Object.FindObjectsOfType<LocalPlayer>())
-				{
-					// Skip anything that already existed, and any mannequin that spawned fine.
-					if (player == null || playersBeforeCreate.Contains(player) || Mannequins.ContainsKey(player))
-					{
-						continue;
-					}
-
-					DebugLog($"Destroying the half-constructed player object LocalPlayer.Create left behind ('{player.name}'), to stop its per-frame LateUpdate NullReferenceExceptions.");
-
-					// Both of these routinely throw on a body that was never finished being built -
-					// that is the whole point of the cleanup, so neither failure should stop the other.
-					try { player.Dispose(); }
-					catch (Exception ex) { Logger.LogDebug($"Dispose() on the orphaned player threw (expected): {ex.Message}"); }
-
-					try { UnityEngine.Object.Destroy(player.gameObject); }
-					catch (Exception ex) { Logger.LogWarning($"Destroy() on the orphaned player threw: {ex.Message}"); }
-				}
-			}
-			catch (Exception ex)
-			{
-				Logger.LogWarning($"Could not clean up orphaned player objects: {ex.Message}");
-			}
-		}
-		/// <summary>
-		/// Makes sure the Raid pool category exists before LocalPlayer.Create runs, since that is
-		/// where it pops the player object from.
-		/// </summary>
-		/// <remarks>
-		/// PORTING NOTE (SPT 4.0.13): this used to also preload the profile's bundles, and that is
-		/// now deliberately gone. Once every mannequin became a copy of the player (see
-		/// GenerateProfileFromPlayerLoadout) every bundle it needs is resident by definition, and
-		/// the preload's own logs proved it had stopped doing anything: "gear: 0/170 loaded,
-		/// 2 already resident, 170 not loaded", on every single mannequin, while the mannequins
-		/// themselves rendered perfectly. BundlesManagerClass simply has no record of bundles the
-		/// hideout loaded through another path, so FindBundle reports them missing and every
-		/// re-request then fails.
-		///
-		/// What it did cost was the remaining spawn hitch: ~170 doomed LoadBundleAsync operations
-		/// per mannequin, each with a coroutine pumping it every frame until the wait expired, six
-		/// times over, plus 4 seconds of blocking per mannequin.
-		/// </remarks>
-		private void EnsureRaidPoolsRegistered()
-		{
-			if (!Singleton<PoolManagerClass>.Instantiated)
-			{
-				Logger.LogWarning("PoolManagerClass singleton is unavailable; the Raid pool category could not be registered.");
-				return;
-			}
-
-			var pools = Singleton<PoolManagerClass>.Instance;
-			if (!pools.IsPoolReady(PoolManagerClass.PoolsCategory.Raid))
-			{
-				pools.RegisterPools(
-					PoolManagerClass.PoolsCategory.Raid,
-					null,
-					ObjectsFactoryDataClass.Default,
-					PoolManagerClass.AssemblyType.Local);
-			}
-		}
-
-
-		/// <summary>
-		/// Temporarily removes SPT's DisableDevMaskCheckPatch transpiler from LocalPlayer.Create's
-		/// async state machine for the duration of the returned scope. On 4.0.13 that transpiler
-		/// double-completes the task when LocalPlayer.Create is invoked outside a real raid (4.1 no
-		/// longer ships it), throwing an InvalidOperationException - same bug and same fix as
-		/// spt-hideout-shootout's backport.
-		/// </summary>
-		private static IDisposable SuppressDisableDevMaskCheckPatch()
-		{
-			try
-			{
-				// PORTING NOTE: "Struct569" is the state machine name confirmed on the client
-				// spt-hideout-shootout was built and tested against; it's a numeric-suffixed
-				// obfuscated name that may differ on another 4.0.13 client build. If suppression
-				// silently no-ops (logged at Warning below) and LocalPlayer.Create still throws an
-				// InvalidOperationException about a task already being completed, the exception's
-				// stack trace will show the real nested type name to use here instead.
-				var stateMachine = typeof(LocalPlayer).GetNestedType("Struct569", BindingFlags.Public | BindingFlags.NonPublic);
-				var moveNext = stateMachine?.GetMethod("MoveNext", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-				if (moveNext == null)
-				{
-					return NoopDisposable.Instance;
-				}
-
-				var info = Harmony.GetPatchInfo(moveNext);
-				var devMaskPatch = info?.Transpilers.FirstOrDefault(p => p.owner == "DisableDevMaskCheckPatch");
-				if (devMaskPatch == null)
-				{
-					return NoopDisposable.Instance;
-				}
-
-				var harmony = new Harmony(devMaskPatch.owner);
-				harmony.Unpatch(moveNext, devMaskPatch.PatchMethod);
-				return new RestorePatchOnDispose(harmony, moveNext, devMaskPatch.PatchMethod);
-			}
-			catch (Exception ex)
-			{
-				Instance.Logger.LogWarning($"SuppressDisableDevMaskCheckPatch failed, proceeding without suppression: {ex.Message}");
-				return NoopDisposable.Instance;
-			}
-		}
-
-		private sealed class NoopDisposable : IDisposable
-		{
-			public static readonly NoopDisposable Instance = new NoopDisposable();
-			public void Dispose() { }
-		}
-
-		private sealed class RestorePatchOnDispose : IDisposable
-		{
-			private readonly Harmony _harmony;
-			private readonly MethodBase _target;
-			private readonly MethodInfo _transpiler;
-
-			public RestorePatchOnDispose(Harmony harmony, MethodBase target, MethodInfo transpiler)
-			{
-				_harmony = harmony;
-				_target = target;
-				_transpiler = transpiler;
-			}
-
-			public void Dispose()
-			{
+				object value = null;
 				try
 				{
-					_harmony.Patch(_target, transpiler: new HarmonyMethod(_transpiler));
+					value = (member as PropertyInfo)?.GetValue(corpse)
+						?? (member as FieldInfo)?.GetValue(corpse);
 				}
-				catch (Exception ex)
-				{
-					Instance.Logger.LogWarning($"Failed to restore DisableDevMaskCheckPatch: {ex.Message}");
-				}
-			}
-		}
+				catch { }
 
-		/// <summary>
-		/// Builds a mannequin profile that is a copy of the player's own character - their
-		/// appearance and the gear they are currently carrying.
-		/// </summary>
-		/// <remarks>
-		/// PORTING NOTE (SPT 4.0.13): this replaces the per-slot MannequinType options, and the reason
-		/// is that no other source of appearance works reliably in the hideout on this client.
-		///
-		/// Real bot profiles (Scav, Tagilla, Raider, ...) need character and gear bundles that are not
-		/// resident, and those cannot be loaded from here: a bundle's dependency list includes the
-		/// global "cubemaps" and "shaders" bundles, which the hideout already holds under a loader
-		/// BundlesManagerClass has no record of, so re-requesting them gets Unity's "another
-		/// AssetBundle with the same files is already loaded", they never register, and the dependent
-		/// load waits on them forever. Every entry point was tried - LoadBundlesAsync batched and
-		/// per-bundle, LoadAssetAsync per ResourceKey, BundlesManagerClass.LoadBundleAsync with
-		/// dependency skipping - and all of them dead-end there. PoolManagerClass.LoadBundlesAndCreatePools,
-		/// which the SPT 4.1 version used, is uncallable because its signature contains GDelegate62,
-		/// a delegate type the CLR refuses to load.
-		///
-		/// The decorative Equipment Presets Stand mannequin skin loads fine, but it is a display prop
-		/// with no ballistic material tagging, so shots produced no flinch and no blood.
-		///
-		/// The player's own character has neither problem: its bundles are resident by definition, and
-		/// it is a real combat model with correct hit materials. It also makes the weapon actually go
-		/// into the mannequin's hands, which stops the MouseLook NullReferenceException that a bot with
-		/// no hands controller threw every single frame - 10,827 of them in one session, which is what
-		/// was costing the framerate.
-		/// </remarks>
-		public Profile GenerateProfileFromPlayerLoadout(Profile playerProfile)
-		{
-			bool unarmored = SpawnUnarmored.Value;
-
-			// Only inject a stand-in melee when it is actually needed: unarmored mode, and the player
-			// has nothing in their own Scabbard for the mannequin to copy.
-			string fallbackMelee = unarmored && FindScabbardItem(playerProfile) == null
-				? FallbackMeleeTemplateId.Value
-				: null;
-
-			var profileDescriptor = GenerateMannequinProfile(fallbackMelee);
-
-			// Take the player's whole appearance - head, body, hands, feet, voice. Every one of these
-			// bundles is guaranteed loadable because the player is standing in the hideout wearing them.
-			foreach (var part in profileDescriptor.Customization.Keys.ToArray())
-			{
-				if (playerProfile.Customization.TryGetValue(part, out var playerValue))
-				{
-					profileDescriptor.Customization[part] = playerValue;
-				}
-			}
-
-			var profile = new Profile(profileDescriptor);
-
-			var profileSlots = profile.Inventory?.Equipment?.Slots;
-			var playerSlots = playerProfile.Inventory?.Equipment?.Slots;
-			if (profileSlots == null || playerSlots == null)
-			{
-				return profile;
-			}
-
-			// Clone whatever the player is actually carrying. Bounded by both arrays: the two profiles
-			// are not guaranteed to declare the same number of equipment slots, and indexing past the
-			// end would throw ArgumentOutOfRangeException.
-			int slotCount = Math.Min(profileSlots.Length, playerSlots.Length);
-			for (var i = 0; i < slotCount; i++)
-			{
-				var originalItem = playerSlots[i].ContainedItem;
-				if (originalItem == null)
+				if (value == null || value is string)
 				{
 					continue;
 				}
 
-				// In unarmored mode the mannequin keeps only its melee weapon. Empty hands are not an
-				// option: a mannequin with no hands controller makes the game throw a
-				// NullReferenceException out of MouseLook every single frame.
-				if (unarmored && !IsScabbardSlot(playerSlots[i]))
-				{
-					continue;
-				}
-
+				string candidate = null;
 				try
 				{
-					var clonedItem = originalItem.CloneItem();
-
-					if (ForceWeaponLightsOff.Value)
-					{
-						TurnOffLights(clonedItem);
-					}
-
-					profileSlots[i].ChangeContainedItemDirectly(clonedItem);
+					candidate = value.GetType().GetProperty("ProfileId", BindingFlags.Public | BindingFlags.Instance)
+						?.GetValue(value) as string;
 				}
-				catch (Exception ex)
+				catch { }
+
+				if (string.Equals(candidate, profileId, StringComparison.Ordinal))
 				{
-					Logger.LogWarning($"Could not clone the player's item in equipment slot {i} onto the mannequin: {ex.Message}");
+					return true;
 				}
 			}
 
-			return profile;
+			return false;
 		}
 
 		/// <summary>
@@ -1812,6 +1475,14 @@ namespace SevenBoldPencil.TargetDummies
 			{
 				DebugLog("Skipping a respawn that a refresh superseded.");
 				yield break;
+			}
+
+			// Safety net for anything the identity match missed: with nothing alive, no corpse in
+			// the range can still belong to a living mannequin, so they can all go. This is also
+			// the only cleanup that runs if a corpse is somehow never matched to its mannequin.
+			if (Mannequins.Count == 0)
+			{
+				DestroyAllCorpses();
 			}
 
 			// Deliberately not awaited - a coroutine cannot await, and SpawnBot already handles its
