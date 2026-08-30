@@ -120,6 +120,10 @@ class Program
 
         RunOne("EFTInventoryClass.get_Equipment", "get_Equipment");
         RunOne("EFTInventoryClass.get_Stash", "get_Stash");
+        // Both getters call this before reading their backing field - need to know whether it's a
+        // lazy-build-once guard (safe to pre-set the field directly) or an unconditional rebuild
+        // from Gclass1390_0/FastAccess every call (which would clobber a directly-set field).
+        RunOne("EFTInventoryClass.method_0", "method_0");
 
         Console.WriteLine("Wrote dump.txt");
     }
