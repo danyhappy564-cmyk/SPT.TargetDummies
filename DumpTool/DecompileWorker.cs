@@ -101,7 +101,7 @@ static class DecompileWorker
         return map;
     });
 
-    static void PrintRawIL(TextWriter w, MethodInfo method)
+    public static void PrintRawIL(TextWriter w, MethodInfo method)
     {
         MethodBody body;
         try { body = method.GetMethodBody(); }

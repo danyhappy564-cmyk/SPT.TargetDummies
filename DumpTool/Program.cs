@@ -93,27 +93,109 @@ class Program
             w.Flush();
         }
 
-        DumpBundleMethods("EFT.AssetsManager.IAssetsManager");
-        DumpBundleMethods("PoolManagerClass");
-        DumpBundleMethods("AssetsManagerSingletonClass");
+        Type Find(string name) => allTypes.FirstOrDefault(x => x.FullName == name || x.Name == name);
 
-        // Also search ALL loaded types for anything with a method named exactly "LoadBundlesAsync"
-        // or similar, in case IAssetsManager isn't the only implementor worth checking.
-        w.WriteLine("=== all types with a method containing both 'Bundle' and 'Async' ===");
-        foreach (var t in allTypes)
+        // Disassembles a method's IL. For an async method the compiler moves the real work into a
+        // generated state machine's MoveNext, so dump that too - the stub itself only starts it.
+        void DumpMethodIL(string typeName, string methodName)
         {
-            MethodInfo[] methods;
-            try
-            {
-                methods = t.GetMethods(flags).Where(m => !m.IsSpecialName
-                    && m.Name.IndexOf("Bundle", StringComparison.OrdinalIgnoreCase) >= 0
-                    && m.Name.IndexOf("Async", StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
-            }
-            catch { continue; }
+            w.WriteLine();
+            w.WriteLine("=== IL: " + typeName + "." + methodName + " ===");
+
+            Type t = Find(typeName);
+            if (t == null) { w.WriteLine("  <type not found>"); w.Flush(); return; }
+
+            var methods = SafeGet(() => t.GetMethods(flags).Where(m => m.Name == methodName).ToArray());
+            if (methods.Length == 0) { w.WriteLine("  <method not found>"); w.Flush(); return; }
 
             foreach (var m in methods)
             {
-                w.WriteLine("  " + t.FullName + " :: " + FormatMethod(m));
+                w.WriteLine("  signature: " + FormatMethod(m));
+                w.WriteLine("  --- body of " + m.Name + " ---");
+                try { DecompileWorker.PrintRawIL(w, m); }
+                catch (Exception ex) { w.WriteLine("  <PrintRawIL failed: " + ex.Message + ">"); }
+
+                // Obfuscated builds still name the state machine after the method it came from.
+                foreach (var nested in SafeGet(() => t.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic)))
+                {
+                    if (nested.Name.IndexOf(methodName, StringComparison.Ordinal) < 0) continue;
+
+                    MethodInfo moveNext = null;
+                    try { moveNext = nested.GetMethod("MoveNext", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); }
+                    catch { }
+                    if (moveNext == null) continue;
+
+                    w.WriteLine("  --- body of state machine " + nested.Name + ".MoveNext ---");
+                    try { DecompileWorker.PrintRawIL(w, moveNext); }
+                    catch (Exception ex) { w.WriteLine("  <PrintRawIL failed: " + ex.Message + ">"); }
+                }
+            }
+            w.Flush();
+        }
+
+        void DumpAllMembers(string typeName)
+        {
+            w.WriteLine();
+            w.WriteLine("=== Members: " + typeName + " ===");
+
+            Type t = Find(typeName);
+            if (t == null) { w.WriteLine("  <type not found>"); w.Flush(); return; }
+
+            foreach (var f in SafeGet(() => t.GetFields(flags)))
+            {
+                string ft;
+                try { ft = f.FieldType.ToString(); } catch (Exception ex) { ft = "<?:" + ex.GetType().Name + ">"; }
+                w.WriteLine("  field: " + ft + " " + f.Name + (f.IsPublic ? " [public]" : ""));
+            }
+
+            foreach (var m in SafeGet(() => t.GetMethods(flags)))
+            {
+                w.WriteLine("  method: " + FormatMethod(m) + (m.IsPublic ? " [public]" : ""));
+            }
+            w.Flush();
+        }
+
+        // 1. The load path the working SPT 4.1 version of this mod actually used.
+        DumpMethodIL("PoolManagerClass", "LoadBundlesAndCreatePools");
+        DumpMethodIL("PoolManagerClass", "method_1");
+        DumpMethodIL("PoolManagerClass", "RegisterPools");
+
+        // 2. The path this backport currently uses, which never completes - for comparison.
+        DumpMethodIL("AssetsManagerClass", "LoadBundlesAsync");
+
+        // 3. A simpler single-bundle API whose signature has no unloadable types in it.
+        DumpAllMembers("BundlesManagerClass");
+        DumpAllMembers("AssetsManagerClass");
+
+        // 4. Every loader-shaped method anywhere that takes ResourceKeys directly, so the string
+        //    conversion (and its per-key-type inconsistency) can be skipped entirely.
+        w.WriteLine();
+        w.WriteLine("=== Methods anywhere taking ResourceKey(s), named like a loader ===");
+        foreach (var t in allTypes)
+        {
+            foreach (var m in SafeGet(() => t.GetMethods(flags).Where(x => !x.IsSpecialName).ToArray()))
+            {
+                if (m.Name.IndexOf("Load", StringComparison.OrdinalIgnoreCase) < 0
+                    && m.Name.IndexOf("Bundle", StringComparison.OrdinalIgnoreCase) < 0
+                    && m.Name.IndexOf("Pool", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    continue;
+                }
+
+                ParameterInfo[] ps;
+                try { ps = m.GetParameters(); }
+                catch { continue; }
+
+                bool takesResourceKey = ps.Any(p =>
+                {
+                    try { return p.ParameterType.ToString().Contains("ResourceKey"); }
+                    catch { return false; }
+                });
+
+                if (takesResourceKey)
+                {
+                    w.WriteLine("  " + t.FullName + " :: " + FormatMethod(m));
+                }
             }
         }
         w.Flush();

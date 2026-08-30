@@ -486,11 +486,15 @@ namespace SevenBoldPencil.TargetDummies
 
 			Logger.LogWarning($"Preloading {bundleNames.Length} bundles individually for profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundleNames.Length} other={otherBundleNames.Length}.");
 
-			// Mesh bundles decide whether the character has a body at all, so they get the longer
-			// wait and per-bundle reporting. Everything else (weapons, rig, ammo) only affects
-			// cosmetic gear, so it gets a short wait and is allowed to lag behind.
-			await LoadBundlesIndividuallyAsync(meshBundleNames, 20, "character mesh", profile.Id, logEachFailure: true);
-			await LoadBundlesIndividuallyAsync(otherBundleNames, 5, "gear", profile.Id, logEachFailure: false);
+			// PORTING NOTE (SPT 4.0.13): the waits used to be 20s for mesh and 5s for gear. Confirmed
+			// in-game that waiting longer buys nothing at all: with every bundle isolated in its own
+			// operation, 0 of 4 character-mesh bundles settled within a full 20s, and they report
+			// neither Succeed nor Failed - they simply never finish. Only bundles that were already
+			// resident complete (3 of 27 gear bundles, instantly). So LoadBundlesAsync is not a
+			// working load path in the hideout at all, and the long wait was costing 25s per bot for
+			// nothing. Kept short purely so the per-bundle diagnostics still get logged.
+			await LoadBundlesIndividuallyAsync(meshBundleNames, 3, "character mesh", profile.Id, logEachFailure: true);
+			await LoadBundlesIndividuallyAsync(otherBundleNames, 2, "gear", profile.Id, logEachFailure: false);
 		}
 
 		/// <summary>
