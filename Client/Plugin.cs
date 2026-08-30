@@ -16,6 +16,7 @@ using EFT.InventoryLogic;
 using EFT.Hideout;
 using Newtonsoft.Json;
 using HarmonyLib;
+using SPT.Reflection.Patching;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -136,10 +137,27 @@ namespace SevenBoldPencil.TargetDummies
 
 			Mannequins = new();
 
-			new Patch_HideoutController_HideoutAwake().Enable();
-			new Patch_GameWorld_DestroyAllLoot().Enable();
-			new Patch_CorpseRagdoll_Start().Enable();
-			new Patch_HideoutAreaTrigger_OnTriggerExit().Enable();
+			// PORTING NOTE (SPT 4.0.13): each patch enabled independently so one Harmony failure
+			// (confirmed in-game: Patch_HideoutAreaTrigger_OnTriggerExit's ____area field injection
+			// doesn't match a real field on HideoutAreaTrigger here - the private field was renamed,
+			// not yet found) doesn't take the others down with it, and logs clearly instead of
+			// crashing Awake() partway through.
+			void TryEnable(ModulePatch patch, string name)
+			{
+				try
+				{
+					patch.Enable();
+				}
+				catch (Exception ex)
+				{
+					LoggerInstance.LogWarning($"Failed to enable patch {name}: {ex.Message}");
+				}
+			}
+
+			TryEnable(new Patch_HideoutController_HideoutAwake(), nameof(Patch_HideoutController_HideoutAwake));
+			TryEnable(new Patch_GameWorld_DestroyAllLoot(), nameof(Patch_GameWorld_DestroyAllLoot));
+			TryEnable(new Patch_CorpseRagdoll_Start(), nameof(Patch_CorpseRagdoll_Start));
+			TryEnable(new Patch_HideoutAreaTrigger_OnTriggerExit(), nameof(Patch_HideoutAreaTrigger_OnTriggerExit));
         }
 
 		public async Task SpawnBot(MannequinData data)
