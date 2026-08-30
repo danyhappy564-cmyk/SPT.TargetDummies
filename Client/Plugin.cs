@@ -769,7 +769,56 @@ namespace SevenBoldPencil.TargetDummies
 			}
 
 			var botType = GetBotType(mannequinType);
-			return await GetBotProfile(session, botType);
+			var botProfile = await GetBotProfile(session, botType);
+			UsePlayerCharacterModel(botProfile, playerProfile);
+			return botProfile;
+		}
+
+		/// <summary>
+		/// Replaces a bot profile's body customization (head, body, hands, feet, voice) with the
+		/// hideout player's own, keeping its gear and weapon.
+		/// </summary>
+		/// <remarks>
+		/// PORTING NOTE (SPT 4.0.13): this is a deliberate compromise, and the reason for it is
+		/// worth recording. A bot's randomly assigned character bundle - e.g.
+		/// assets/content/characters/character/prefabs/wild_head_1.bundle - cannot be loaded from
+		/// inside the hideout on this client. Confirmed from the game's own logs: the bundle is
+		/// never reported missing and never 404s, but its dependency list includes the global
+		/// "cubemaps" and "shaders" bundles, which the hideout already has resident under a loader
+		/// that BundlesManagerClass has no record of. Asking for them again gets Unity's "another
+		/// AssetBundle with the same files is already loaded", they therefore never register, and
+		/// the head bundle's own load operation waits on them forever - it reports neither Succeed
+		/// nor Failed. LocalPlayer.Create then throws "&lt;head&gt; is not loaded" partway through,
+		/// leaving an invisible, half-built body. Every load entry point on this client was tried
+		/// (LoadBundlesAsync batched and per-bundle, LoadAssetAsync per ResourceKey, and
+		/// BundlesManagerClass.LoadBundleAsync with dependency skipping) and all four dead-end at
+		/// that same dependency deadlock. PoolManagerClass.LoadBundlesAndCreatePools, which the SPT
+		/// 4.1 version of this mod used and which presumably handles this correctly, is uncallable
+		/// here: its signature contains GDelegate62, a delegate type the CLR refuses to load.
+		///
+		/// The player's own character bundles, by contrast, are always resident - the player is
+		/// standing in the hideout wearing them. Reusing them makes every bot type spawn reliably
+		/// with a visible body that takes hits, dies and respawns. The cost is that bots wear the
+		/// player's face and body rather than their own; their gear, weapon and behaviour are still
+		/// the real bot's. MannequinType.Mannequin1/2/3 already worked for exactly this reason.
+		/// </remarks>
+		private void UsePlayerCharacterModel(Profile botProfile, Profile playerProfile)
+		{
+			if (botProfile?.Customization == null || playerProfile?.Customization == null)
+			{
+				return;
+			}
+
+			// Only ever overwrite parts the bot profile already declares. Profile.GetAllPrefabPaths
+			// indexes Customization[part] directly for every EBodyModelPart, so adding or removing a
+			// key here would throw KeyNotFoundException instead of being skipped.
+			foreach (var part in botProfile.Customization.Keys.ToArray())
+			{
+				if (playerProfile.Customization.TryGetValue(part, out var playerValue))
+				{
+					botProfile.Customization[part] = playerValue;
+				}
+			}
 		}
 
 		public Profile GenerateProfileWithMannequinEquipment(Profile playerProfile, int mannequinIndex)
