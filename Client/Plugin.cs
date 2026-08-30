@@ -12,6 +12,7 @@ using Comfort.Common;
 using Diz.Jobs;
 using EFT;
 using EFT.AssetsManager;
+using EFT.Interactive;
 using EFT.InventoryLogic;
 using EFT.Hideout;
 using Newtonsoft.Json;
@@ -440,6 +441,124 @@ namespace SevenBoldPencil.TargetDummies
 			{
 				Logger.LogError(e);
 				DestroyOrphanedPlayers(playersBeforeCreate);
+			}
+		}
+
+		/// <summary>
+		/// Removes a mannequin from the world: its corpse first, then the player object itself.
+		/// </summary>
+		/// <remarks>
+		/// PORTING NOTE (SPT 4.0.13): destroying the corpse is the part that was missing. Disposing
+		/// the player and returning it to the pool leaves the Corpse loot item behind in
+		/// GameWorld.LootList, so the next mannequin spawned at that slot stands inside the previous
+		/// one's body. In-game that showed up as a live, aiming mannequin carrying "search"/"corpse"
+		/// interaction prompts, and as bodies being flung across the room by the overlapping
+		/// colliders. They also stacked up, one more per kill, for the whole session.
+		/// </remarks>
+		private void DespawnMannequin(LocalPlayer bot)
+		{
+			if (bot == null)
+			{
+				return;
+			}
+
+			DestroyCorpseOf(bot);
+
+			try
+			{
+				bot.Dispose();
+				AssetPoolObject.ReturnToPool(bot.gameObject, true);
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not despawn a mannequin: {ex.GetType().Name}: {ex.Message}");
+			}
+		}
+
+		/// <summary>Destroys the corpse loot item a dead mannequin left in the world, if any.</summary>
+		private void DestroyCorpseOf(LocalPlayer bot)
+		{
+			try
+			{
+				var gameWorld = Singleton<GameWorld>.Instance;
+				if (gameWorld?.LootList == null)
+				{
+					return;
+				}
+
+				string profileId = bot.ProfileId;
+				Vector3 position = bot.Transform != null ? bot.Transform.position : bot.transform.position;
+
+				foreach (var corpse in gameWorld.LootList.OfType<Corpse>().ToArray())
+				{
+					if (!CorpseBelongsTo(corpse, profileId, position))
+					{
+						continue;
+					}
+
+					DebugLog($"Destroying the corpse left by mannequin {profileId}.");
+					gameWorld.DestroyLoot(corpse);
+				}
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not clean up a mannequin's corpse: {ex.GetType().Name}: {ex.Message}");
+			}
+		}
+
+		/// <summary>
+		/// Matches a corpse to the mannequin that produced it - by profile id where the corpse
+		/// exposes one, otherwise by position, since mannequins occupy fixed, well separated slots.
+		/// </summary>
+		private static bool CorpseBelongsTo(Corpse corpse, string profileId, Vector3 position)
+		{
+			if (corpse == null)
+			{
+				return false;
+			}
+
+			if (!string.IsNullOrEmpty(profileId))
+			{
+				foreach (var member in corpse.GetType().GetMembers(BindingFlags.Public | BindingFlags.Instance))
+				{
+					object value = null;
+					try
+					{
+						value = (member as PropertyInfo)?.GetValue(corpse)
+							?? (member as FieldInfo)?.GetValue(corpse);
+					}
+					catch { }
+
+					if (value == null || value is string)
+					{
+						continue;
+					}
+
+					string candidate = null;
+					try
+					{
+						candidate = value.GetType().GetProperty("ProfileId", BindingFlags.Public | BindingFlags.Instance)
+							?.GetValue(value) as string;
+					}
+					catch { }
+
+					if (string.Equals(candidate, profileId, StringComparison.Ordinal))
+					{
+						return true;
+					}
+				}
+			}
+
+			// Fallback: the corpse dropped where the mannequin stood. Slots are metres apart, so a
+			// tight radius cannot pick up a neighbouring mannequin's body.
+			try
+			{
+				return corpse.transform != null
+					&& (corpse.transform.position - position).sqrMagnitude <= 4f;
+			}
+			catch
+			{
+				return false;
 			}
 		}
 
@@ -1496,15 +1615,7 @@ namespace SevenBoldPencil.TargetDummies
 			{
 				Mannequins.Remove(pair.Key);
 
-				try
-				{
-					pair.Key.Dispose();
-					AssetPoolObject.ReturnToPool(pair.Key.gameObject, true);
-				}
-				catch (Exception ex)
-				{
-					Logger.LogWarning($"Could not despawn a mannequin during refresh: {ex.GetType().Name}: {ex.Message}");
-				}
+				DespawnMannequin(pair.Key);
 
 				yield return null;
 			}
@@ -1591,8 +1702,7 @@ namespace SevenBoldPencil.TargetDummies
 			// the death effects. The corpse now has its own, separately bounded timing.
 			yield return new WaitForSeconds(CorpseLinger.Value);
 
-			bot.Dispose();
-			AssetPoolObject.ReturnToPool(bot.gameObject, true);
+			DespawnMannequin(bot);
 
 			yield return new WaitForSeconds(SpawnInterval.Value);
 
