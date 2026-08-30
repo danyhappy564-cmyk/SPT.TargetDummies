@@ -394,16 +394,67 @@ namespace SevenBoldPencil.TargetDummies
 				.Distinct()
 				.ToArray();
 
-			bool anyHeadBundleRequested = bundleNames.Any(n => n.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0);
-			Logger.LogWarning($"Preloading {bundleNames.Length} bundle names for mannequin profile {profile.Id} ({resourceKeys.Length} resource keys); anyHeadBundleRequested={anyHeadBundleRequested}. Sample: {string.Join(" | ", bundleNames.Take(10))}");
-
 			if (bundleNames.Length == 0)
 			{
 				Logger.LogWarning($"No usable bundle names were produced for mannequin profile {profile.Id}; proceeding anyway.");
 				return;
 			}
 
-			var operation = assetsManager.LoadBundlesAsync(bundleNames);
+			// PORTING NOTE (SPT 4.0.13): confirmed via errors.log on non-Mannequin (real
+			// WildSpawnType, e.g. Scav/Tagilla) profiles - the flat 5s wait below was tuned for
+			// Mannequin profiles (~5-6 bundles, already cached from the player's own hideout gear).
+			// Real bot profiles carry full randomized loadouts (~20-40+ bundles: weapon, mods,
+			// ammo, clothing, voice), and several of those (boss-specific weapon mods, voice lines)
+			// 404 permanently on this server - so the whole-batch wait still never resolves to
+			// Succeed, same as always. Unlike the Mannequin case though, the character mesh bundles
+			// themselves (head/body/hands) are legitimate always-present assets that simply hadn't
+			// finished loading yet within 5s among the larger mixed batch, causing
+			// "<head bundle> is not loaded" mid-construction - a fully invisible character, not
+			// just missing gear/voice.
+			//
+			// Fix: load the character-mesh bundles in their own small batch first and wait for
+			// THAT to fully succeed (never contains a permanently-missing entry, so it reliably
+			// completes) before touching the large mixed batch with the old short timeout.
+			bool IsCharacterMeshBundle(string name) =>
+				name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+				name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+				name.IndexOf("/content/feet/", StringComparison.OrdinalIgnoreCase) >= 0;
+
+			var meshBundleNames = bundleNames.Where(IsCharacterMeshBundle).ToArray();
+			var otherBundleNames = bundleNames.Where(name => !IsCharacterMeshBundle(name)).ToArray();
+
+			Logger.LogWarning($"Preloading {bundleNames.Length} bundle names for mannequin profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundleNames.Length} other={otherBundleNames.Length}. Sample: {string.Join(" | ", bundleNames.Take(10))}");
+
+			if (meshBundleNames.Length > 0)
+			{
+				var meshOperation = assetsManager.LoadBundlesAsync(meshBundleNames);
+				var meshTcs = new TaskCompletionSource<bool>();
+				StartCoroutine(DriveOperationCoroutine(meshOperation, meshTcs));
+
+				const double meshTimeoutSeconds = 20;
+				var meshWaitStart = DateTime.UtcNow;
+				while (true)
+				{
+					var completed = await Task.WhenAny(meshTcs.Task, Task.Delay(TimeSpan.FromSeconds(1)));
+					if (completed == meshTcs.Task)
+					{
+						break;
+					}
+
+					if ((DateTime.UtcNow - meshWaitStart).TotalSeconds >= meshTimeoutSeconds)
+					{
+						Logger.LogWarning($"Character mesh bundle preload timed out for profile {profile.Id} after {meshTimeoutSeconds}s; proceeding anyway (character may be invisible).");
+						break;
+					}
+				}
+			}
+
+			if (otherBundleNames.Length == 0)
+			{
+				return;
+			}
+
+			var operation = assetsManager.LoadBundlesAsync(otherBundleNames);
 
 			var tcs = new TaskCompletionSource<bool>();
 			StartCoroutine(DriveOperationCoroutine(operation, tcs));
@@ -411,19 +462,16 @@ namespace SevenBoldPencil.TargetDummies
 			// PORTING NOTE (SPT 4.0.13): confirmed in-game - waiting for the WHOLE batch to report
 			// Succeed==true never worked reliably in this modded environment, even with as few as
 			// 5 bundles requested (a fixed mannequin skin, no random gear at all). Every single
-			// spawn hits the same shape: 4 of the 5 resolve almost immediately, and the 5th (a
-			// voice/animation-bank reference like "BossTagilla.bundle" with no consistent naming
-			// pattern to filter on - unlike the audio/ path ones already excluded above) never
-			// resolves no matter how long the wait. The batch operation appears to never resolve to
-			// Succeed OR Failed if even one bundle in it is permanently unreachable - it just hangs
-			// until an external caller gives up.
-			//
-			// Since real content consistently finishes almost immediately and the remainder never
-			// finishes no matter how long we wait, a short timeout wastes far less time than a long
-			// one for the same outcome - cut from 15s to 5s (confirmed via the "20-30s per
-			// mannequin" complaint that most of that time was this wait, not LocalPlayer.Create
-			// itself). Skipping the mannequin entirely on a timeout was tried and reverted - that
-			// produced zero spawns at all, worse than one with a missing gear/voice piece.
+			// spawn hits the same shape: most bundles resolve almost immediately, and one or more
+			// (a voice/animation-bank reference like "BossTagilla.bundle", or a boss-specific
+			// weapon-mod bundle absent from this server, with no consistent naming pattern to
+			// filter on - unlike the audio/ path ones already excluded above) never resolve no
+			// matter how long the wait. The batch operation appears to never resolve to Succeed OR
+			// Failed if even one bundle in it is permanently unreachable - it just hangs until an
+			// external caller gives up. Character mesh bundles are handled separately above with
+			// their own reliable wait, so this short timeout now only affects non-essential gear/
+			// weapon/voice bundles - missing ones there degrade to missing gear visuals, not an
+			// invisible character.
 			const double timeoutSeconds = 5;
 			var waitStart = DateTime.UtcNow;
 			while (true)
