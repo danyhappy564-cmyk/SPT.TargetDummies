@@ -9,7 +9,6 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using Comfort.Common;
-using Diz.Jobs;
 using EFT;
 using EFT.AssetsManager;
 using EFT.InventoryLogic;
@@ -21,6 +20,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -158,51 +158,102 @@ namespace SevenBoldPencil.TargetDummies
 
 			var botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile, data.Type.Value);
 
-			await Singleton<ObjectsFactory>.Instance.LoadBundlesAndCreatePools
-			(
-				ObjectsFactory.PoolsCategory.Raid,
-				ObjectsFactory.AssemblyType.Local,
-				botPlayerProfile.GetAllPrefabPaths(true).ToArray<ResourceKey>(),
-				JobYieldPriority.General,
-				null,
-				ObjectsFactory.DefaultCancellationToken
-			);
+			// PORTING NOTE (SPT 4.0.13): confirmed by spt-hideout-shootout's own backport - the
+			// hands-rig bundle (assets/content/hands/*.bundle) is never loadable outside a real
+			// raid's own loading screen, regardless of which bundle-loading API is used beforehand.
+			// PlayerBody.Init throws "X is not loaded. You should load it first." for it every time.
+			// Stripping the Hands customization entry here means the mannequin spawns bare-handed
+			// instead of not spawning at all - same trade-off spt-hideout-shootout made.
+			try
+			{
+				botPlayerProfile.Customization?.Remove(EBodyModelPart.Hands);
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not strip EBodyModelPart.Hands from mannequin profile {botPlayerProfile?.Id}'s customization: {ex.Message}");
+			}
+
+			// PORTING NOTE (SPT 4.0.13): ObjectsFactory.LoadBundlesAndCreatePools (4.1's name for
+			// this singleton/method pair) doesn't exist under that name here - PoolManagerClass is
+			// the obfuscated 4.0.13 name, and its equivalent LoadBundlesAndCreatePools has a
+			// malformed callback delegate type the CLR refuses to load from mod code. Same blocker
+			// already solved in spt-hideout-shootout's own 4.0.13 backport: register the Raid pool
+			// category via RegisterPools for capacity, then actually load the bundles through
+			// IAssetsManager.LoadBundlesAsync(string[]), trying every known ResourceKey->string
+			// conversion in turn since which one "works" isn't documented.
+			await PreloadProfileBundlesAsync(botPlayerProfile);
 
 			var botPlayerId = hideoutGame.NextPlayerId();
 			var rotation = Quaternion.LookRotation((localPlayerPosition - data.Position).normalized);
 
-			var botPlayer = await LocalPlayer.Create
-			(
-				gameWorld: hideoutGameWorld,
-				playerId: botPlayerId,
-				position: data.Position,
-				rotation: rotation,
-				layerName: "Player",
-				prefix: "",
-				pointOfView: EPointOfView.ThirdPerson,
-				profile: botPlayerProfile,
-				aiControl: true,
-				updateQueue: hideoutGame.UpdateQueue,
-				armsUpdateMode: Player.EUpdateMode.Auto,
-				bodyUpdateMode: Player.EUpdateMode.Auto,
-				characterControllerMode: AppEnvironment.Config.CharacterController.BotPlayerMode,
-				getSensitivity: new Func<float>(LocalGame.CG_Class1642.CG_Class1642.method_4),
-				getAimingSensitivity: new Func<float>(LocalGame.CG_Class1642.CG_Class1642.method_5),
-				statisticsManager: new DumbStatisticsManager(),
-				filter: ThirdPersonCustomizationFilter.Default,
-				session: null,
-				localMode: ELocalMode.TRAINING,
-				isYourPlayer: false,
-				isBot: true
-			);
+			// PORTING NOTE (SPT 4.0.13): AppEnvironment.Config.CharacterController.BotPlayerMode has
+			// no equivalent preset instance on this client - built directly instead, same as
+			// spt-hideout-shootout's backport.
+			var botControllerMode = new CharacterControllerSpawner.Mode
+			{
+				Type = CharacterControllerSpawner.ControllerType.BotAISteeringImpostorWithDoors,
+			};
+
+			// PORTING NOTE (SPT 4.0.13): LocalPlayer.Create's 21-argument signature is unchanged,
+			// but several argument types/sources are 4.1-only and don't exist here:
+			// - LocalGame.CG_Class1642.CG_Class1642.method_4/method_5 (obfuscated 4.1 sensitivity
+			//   callbacks) -> plain () => 1f lambdas (mannequins don't move the camera anyway).
+			// - DumbStatisticsManager -> GClass2265 (same dependency-free IStatisticsManager shape).
+			// - ThirdPersonCustomizationFilter.Default -> GClass1855.Default (one of two concrete
+			//   IViewFilter siblings; verify in-game that the mannequin's customization renders
+			//   correctly in third person - if not, try GClass1856.Default instead).
+			// Passed positionally rather than by name since the obfuscated build's real parameter
+			// names aren't confirmed to match 4.1's.
+			LocalPlayer botPlayer;
+			using (SuppressDisableDevMaskCheckPatch())
+			{
+				botPlayer = await LocalPlayer.Create(
+					hideoutGameWorld,
+					botPlayerId,
+					data.Position,
+					rotation,
+					"Player",
+					"",
+					EPointOfView.ThirdPerson,
+					botPlayerProfile,
+					true,
+					hideoutGame.UpdateQueue,
+					Player.EUpdateMode.Auto,
+					Player.EUpdateMode.Auto,
+					botControllerMode,
+					new Func<float>(() => 1f),
+					new Func<float>(() => 1f),
+					new GClass2265(),
+					GClass1855.Default,
+					null,
+					ELocalMode.TRAINING,
+					false,
+					true);
+			}
+
+			if (botPlayer == null)
+			{
+				Logger.LogWarning($"LocalPlayer.Create returned null for mannequin profile {botPlayerProfile.Id}.");
+				return;
+			}
 
 			// TODO for some reason clothes skinned mesh renderers have enabled forceRenderingOff,
 			// I guess culling component thinks that they are not in camera view because
 			// something is not initalized properly, so for now just force rendering on
 
-			// TODO have to manually update player culling toggle?
-			var playerCulling = botPlayer.GetField<LocalPlayer, OfflinePlayerCulling>("botPlayerCulling");
-			playerCulling.SetMode(BasePlayerCulling.EMode.Visible);
+			// PORTING NOTE (SPT 4.0.13): the field is named localPlayerCullingHandlerClass here
+			// (4.1 called it botPlayerCulling), typed LocalPlayerCullingHandlerClass rather than
+			// OfflinePlayerCulling - confirmed by spt-hideout-shootout's backport to inherit
+			// Disable()/ApplyVisibleState()/Mode/IsVisible instead of exposing SetMode directly.
+			if (botPlayer.GetField<LocalPlayer, LocalPlayerCullingHandlerClass>("localPlayerCullingHandlerClass") is LocalPlayerCullingHandlerClass playerCulling)
+			{
+				playerCulling.Disable();
+				playerCulling.ApplyVisibleState();
+			}
+			else
+			{
+				Logger.LogWarning("Could not resolve LocalPlayer.localPlayerCullingHandlerClass; mannequin body may stay invisible.");
+			}
 
 			// take weapon in hands
 			botPlayer.SetSlotItem(EquipmentSlot.FirstPrimaryWeapon, (_) => {});
@@ -216,7 +267,189 @@ namespace SevenBoldPencil.TargetDummies
 			}
 		}
 
-		public async Task<Profile> GenerateProfile(IEftSession session, Profile playerProfile, MannequinType mannequinType)
+		/// <summary>
+		/// Loads the mannequin's prefabs into the Raid asset pools before LocalPlayer.Create runs.
+		/// Ported from spt-hideout-shootout's proven 4.0.13 fix for the same
+		/// ObjectsFactory/PoolManagerClass gap - see the PORTING NOTE in SpawnBot above.
+		/// </summary>
+		private async Task PreloadProfileBundlesAsync(Profile profile)
+		{
+			if (Singleton<PoolManagerClass>.Instantiated)
+			{
+				var pools = Singleton<PoolManagerClass>.Instance;
+				if (!pools.IsPoolReady(PoolManagerClass.PoolsCategory.Raid))
+				{
+					pools.RegisterPools(
+						PoolManagerClass.PoolsCategory.Raid,
+						null,
+						ObjectsFactoryDataClass.Default,
+						PoolManagerClass.AssemblyType.Local);
+				}
+			}
+			else
+			{
+				Logger.LogWarning("PoolManagerClass singleton is unavailable; the Raid pool category could not be registered.");
+			}
+
+			var assetsManager = AssetsManagerSingletonClass.Manager;
+			if (assetsManager == null)
+			{
+				Logger.LogWarning("AssetsManagerSingletonClass.Manager is unavailable; mannequin bundles cannot be preloaded.");
+				return;
+			}
+
+			var resourceKeys = profile.GetAllPrefabPaths(true).Where(key => key != null).ToArray();
+			if (resourceKeys.Length == 0)
+			{
+				Logger.LogWarning($"Profile {profile.Id} reported no prefab resource keys to preload.");
+				return;
+			}
+
+			string SafeToAssetName(ResourceKey key)
+			{
+				try { return key.ToAssetName(); }
+				catch { return null; }
+			}
+
+			(string Label, Func<ResourceKey, string> Selector)[] candidates =
+			{
+				("ToAssetName()", SafeToAssetName),
+				("rcid", key => key.rcid),
+				("path", key => key.path),
+			};
+
+			const double candidateTimeoutSeconds = 20;
+
+			foreach (var candidate in candidates)
+			{
+				var bundleNames = resourceKeys
+					.Select(candidate.Selector)
+					.Where(name => !string.IsNullOrEmpty(name))
+					.Distinct()
+					.ToArray();
+
+				if (bundleNames.Length == 0)
+				{
+					continue;
+				}
+
+				var operation = assetsManager.LoadBundlesAsync(bundleNames);
+
+				var tcs = new TaskCompletionSource<bool>();
+				StartCoroutine(DriveOperationCoroutine(operation, tcs));
+
+				var waitStart = DateTime.UtcNow;
+				var timedOut = false;
+				while (true)
+				{
+					var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(2)));
+					if (completed == tcs.Task)
+					{
+						break;
+					}
+
+					if ((DateTime.UtcNow - waitStart).TotalSeconds >= candidateTimeoutSeconds)
+					{
+						timedOut = true;
+						break;
+					}
+				}
+
+				if (timedOut)
+				{
+					continue;
+				}
+
+				if (operation.Succeed)
+				{
+					return;
+				}
+			}
+
+			Logger.LogWarning($"Every bundle key candidate failed or timed out for mannequin profile {profile.Id}; proceeding anyway.");
+		}
+
+		private static IEnumerator DriveOperationCoroutine(IOperation operation, TaskCompletionSource<bool> tcs)
+		{
+			yield return operation;
+			tcs.TrySetResult(operation.Succeed);
+		}
+
+		/// <summary>
+		/// Temporarily removes SPT's DisableDevMaskCheckPatch transpiler from LocalPlayer.Create's
+		/// async state machine for the duration of the returned scope. On 4.0.13 that transpiler
+		/// double-completes the task when LocalPlayer.Create is invoked outside a real raid (4.1 no
+		/// longer ships it), throwing an InvalidOperationException - same bug and same fix as
+		/// spt-hideout-shootout's backport.
+		/// </summary>
+		private static IDisposable SuppressDisableDevMaskCheckPatch()
+		{
+			try
+			{
+				// PORTING NOTE: "Struct569" is the state machine name confirmed on the client
+				// spt-hideout-shootout was built and tested against; it's a numeric-suffixed
+				// obfuscated name that may differ on another 4.0.13 client build. If suppression
+				// silently no-ops (logged at Warning below) and LocalPlayer.Create still throws an
+				// InvalidOperationException about a task already being completed, the exception's
+				// stack trace will show the real nested type name to use here instead.
+				var stateMachine = typeof(LocalPlayer).GetNestedType("Struct569", BindingFlags.Public | BindingFlags.NonPublic);
+				var moveNext = stateMachine?.GetMethod("MoveNext", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+				if (moveNext == null)
+				{
+					return NoopDisposable.Instance;
+				}
+
+				var info = Harmony.GetPatchInfo(moveNext);
+				var devMaskPatch = info?.Transpilers.FirstOrDefault(p => p.owner == "DisableDevMaskCheckPatch");
+				if (devMaskPatch == null)
+				{
+					return NoopDisposable.Instance;
+				}
+
+				var harmony = new Harmony(devMaskPatch.owner);
+				harmony.Unpatch(moveNext, devMaskPatch.PatchMethod);
+				return new RestorePatchOnDispose(harmony, moveNext, devMaskPatch.PatchMethod);
+			}
+			catch (Exception ex)
+			{
+				Instance.Logger.LogWarning($"SuppressDisableDevMaskCheckPatch failed, proceeding without suppression: {ex.Message}");
+				return NoopDisposable.Instance;
+			}
+		}
+
+		private sealed class NoopDisposable : IDisposable
+		{
+			public static readonly NoopDisposable Instance = new NoopDisposable();
+			public void Dispose() { }
+		}
+
+		private sealed class RestorePatchOnDispose : IDisposable
+		{
+			private readonly Harmony _harmony;
+			private readonly MethodBase _target;
+			private readonly MethodInfo _transpiler;
+
+			public RestorePatchOnDispose(Harmony harmony, MethodBase target, MethodInfo transpiler)
+			{
+				_harmony = harmony;
+				_target = target;
+				_transpiler = transpiler;
+			}
+
+			public void Dispose()
+			{
+				try
+				{
+					_harmony.Patch(_target, transpiler: new HarmonyMethod(_transpiler));
+				}
+				catch (Exception ex)
+				{
+					Instance.Logger.LogWarning($"Failed to restore DisableDevMaskCheckPatch: {ex.Message}");
+				}
+			}
+		}
+
+		public async Task<Profile> GenerateProfile(ISession session, Profile playerProfile, MannequinType mannequinType)
 		{
 			if (mannequinType == MannequinType.Mannequin1)
 			{
@@ -353,7 +586,7 @@ namespace SevenBoldPencil.TargetDummies
 			};
 		}
 
-		public async Task<Profile> GetBotProfile(IEftSession session, WildSpawnType botType)
+		public async Task<Profile> GetBotProfile(ISession session, WildSpawnType botType)
 		{
 			var botProfileRequest = new CountTypeBotWave(1, botType, BotDifficulty.normal);
 			var profilesRequest = new List<CountTypeBotWave>(1) { botProfileRequest };
