@@ -101,8 +101,8 @@ class Program
             {
                 var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
                 bool hasOwner = fields.Any(f => f.Name == "_owner");
-                bool hasStoppedEvent = fields.Any(f => f.Name.Contains("onRigidbodyStopped", StringComparison.OrdinalIgnoreCase));
-                bool nameMatch = t.Name.Contains("Ragdoll", StringComparison.OrdinalIgnoreCase);
+                bool hasStoppedEvent = fields.Any(f => f.Name.IndexOf("onRigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0);
+                bool nameMatch = t.Name.IndexOf("Ragdoll", StringComparison.OrdinalIgnoreCase) >= 0;
 
                 if ((hasOwner && hasStoppedEvent) || nameMatch)
                 {
