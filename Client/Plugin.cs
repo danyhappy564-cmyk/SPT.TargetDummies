@@ -9,6 +9,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using Comfort.Common;
+using Diz.Jobs;
 using EFT;
 using EFT.AssetsManager;
 using EFT.InventoryLogic;
