@@ -189,7 +189,11 @@ class Program
         }
 
         // The registry is the thing to populate - dump the IL of anything that writes to it.
-        foreach (var name in new[] { "PlayerDamageRegistry", "ImpactStatic", "GameWorldStartedPostfixPatch", "ShotDelegateWrapperPatch", "MaterialRegistry" })
+        // Round 10: death gore never plays on these mannequins. RagdollStartPrefixPatch is where
+        // HollywoodFX hooks the ragdoll (its nested <>O holds a CheckCorpseIsStill delegate, so it
+        // waits for the body to settle first), and GoreController.Apply is what actually emits the
+        // blood - dump both, plus what gates them.
+        foreach (var name in new[] { "RagdollStartPrefixPatch", "GoreController", "BodyImpactEffects", "PlayerDamage", "PlayerDamageRegistry", "ImpactController", "ImpactStatic" })
         {
             Type t = Find(name);
             if (t == null) continue;

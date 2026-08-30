@@ -165,11 +165,11 @@ namespace SevenBoldPencil.TargetDummies
 				+ "Lower is faster but spawns more work into a single frame.",
 				new AcceptableValueRange<float>(0.1f, 5f), new ConfigurationManagerAttributes { Order = 6 }));
 
-			CorpseLinger = Config.Bind<float>("Mannequin Settings", "Corpse Linger", 2f, new ConfigDescription(
-				"Seconds a body stays before it is removed and respawned. HollywoodFX attaches its blood and "
-				+ "gore to the ragdoll when the ragdoll starts, so removing the body too early cuts the effect "
-				+ "off before it plays. Raise this if kills stop producing blood.",
-				new AcceptableValueRange<float>(0.5f, 10f), new ConfigurationManagerAttributes { Order = 8 }));
+			CorpseLinger = Config.Bind<float>("Mannequin Settings", "Corpse Linger", 5f, new ConfigDescription(
+				"Seconds a body stays before it is removed and respawned. HollywoodFX waits for the ragdoll to "
+				+ "come to rest before it plays its blood and gore, so removing the body too early cuts the "
+				+ "effect off entirely. Raise this if kills stop producing blood.",
+				new AcceptableValueRange<float>(0.5f, 30f), new ConfigurationManagerAttributes { Order = 8 }));
 
 			FallbackMeleeTemplateId = Config.Bind<string>("Mannequin Settings", "Fallback Melee Template Id", "54491bb74bdc2d09088b4567", new ConfigDescription(
 				"Item template id given to an unarmored mannequin when you are not carrying a melee weapon yourself. "
