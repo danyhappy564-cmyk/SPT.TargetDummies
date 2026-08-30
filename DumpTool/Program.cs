@@ -9,9 +9,14 @@ using System.Text;
 // SPT 4.0.13 backport can be fixed against actual signatures instead of guesses. Not part of
 // the mod - delete this project once the backport is done.
 //
-// Round 6: EFT.HideoutGame doesn't have GameWorld/Profile/NextPlayerId directly - plain reflection
-// dump (no decompiling needed this time) of its full member list, own + inherited, plus its base
-// type chain, to find whatever replaced them.
+// Round 7: hand-converting ResourceKey to a bundle-name string (ToAssetName()/rcid/path) is
+// unreliable - confirmed in-game that even ToAssetName() alone still produces backslash-mixed,
+// unsuffixed strings that 404 for some resource key types (clothing/weapon mods), while working
+// fine for others (character head/body). Rather than keep guessing per-key-type string formats,
+// dump every method on IAssetsManager/PoolManagerClass whose name contains "Bundle" or "Load", to
+// find one that accepts ResourceKey[] directly (the type the profile's own GetAllPrefabPaths
+// already returns) and does the string conversion correctly internally per key - which is
+// presumably what a real raid's own bot-spawning code path uses.
 class Program
 {
     static void Main(string[] args)
@@ -61,52 +66,54 @@ class Program
         }
 
         using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
-
-        Type hideoutGameType = allTypes.FirstOrDefault(t => t.FullName == "EFT.HideoutGame");
-        if (hideoutGameType == null)
-        {
-            w.WriteLine("EFT.HideoutGame not found.");
-            w.Flush();
-            Console.WriteLine("Wrote dump.txt");
-            return;
-        }
-
-        w.WriteLine("=== EFT.HideoutGame base type chain ===");
-        for (Type bt = hideoutGameType; bt != null; bt = bt.BaseType)
-        {
-            w.WriteLine("  " + bt);
-        }
-        w.Flush();
-
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
-            | BindingFlags.Instance | BindingFlags.FlattenHierarchy;
+            | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
 
-        w.WriteLine();
-        w.WriteLine("=== EFT.HideoutGame properties (own + inherited) ===");
-        foreach (var p in SafeGet(() => hideoutGameType.GetProperties(flags)))
+        void DumpBundleMethods(string typeFullName)
         {
-            w.WriteLine("  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name + " (declared on " + p.DeclaringType + ")");
-        }
-        w.Flush();
-
-        w.WriteLine();
-        w.WriteLine("=== EFT.HideoutGame fields (own + inherited) ===");
-        foreach (var f in SafeGet(() => hideoutGameType.GetFields(flags)))
-        {
-            w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + " (declared on " + f.DeclaringType + ")");
-        }
-        w.Flush();
-
-        w.WriteLine();
-        w.WriteLine("=== EFT.HideoutGame methods matching Player/Id/World/Profile (own + inherited) ===");
-        foreach (var m in SafeGet(() => hideoutGameType.GetMethods(flags).Where(m => !m.IsSpecialName).ToArray()))
-        {
-            if (m.Name.IndexOf("Player", StringComparison.OrdinalIgnoreCase) >= 0
-                || m.Name.IndexOf("World", StringComparison.OrdinalIgnoreCase) >= 0
-                || m.Name.IndexOf("Profile", StringComparison.OrdinalIgnoreCase) >= 0
-                || m.Name.IndexOf("Id", StringComparison.OrdinalIgnoreCase) >= 0)
+            w.WriteLine("=== " + typeFullName + " methods containing 'Bundle' or 'Load' ===");
+            Type t = allTypes.FirstOrDefault(x => x.FullName == typeFullName || x.Name == typeFullName);
+            if (t == null)
             {
-                w.WriteLine("  method: " + m + " (declared on " + m.DeclaringType + ")");
+                w.WriteLine("  not found");
+                w.WriteLine();
+                w.Flush();
+                return;
+            }
+
+            foreach (var m in SafeGet(() => t.GetMethods(flags).Where(m => !m.IsSpecialName).ToArray()))
+            {
+                if (m.Name.IndexOf("Bundle", StringComparison.OrdinalIgnoreCase) >= 0
+                    || m.Name.IndexOf("Load", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    w.WriteLine("  method: " + FormatMethod(m) + (m.IsPublic ? " [public]" : " [non-public]") + (m.IsStatic ? " [static]" : ""));
+                }
+            }
+            w.WriteLine();
+            w.Flush();
+        }
+
+        DumpBundleMethods("EFT.AssetsManager.IAssetsManager");
+        DumpBundleMethods("PoolManagerClass");
+        DumpBundleMethods("AssetsManagerSingletonClass");
+
+        // Also search ALL loaded types for anything with a method named exactly "LoadBundlesAsync"
+        // or similar, in case IAssetsManager isn't the only implementor worth checking.
+        w.WriteLine("=== all types with a method containing both 'Bundle' and 'Async' ===");
+        foreach (var t in allTypes)
+        {
+            MethodInfo[] methods;
+            try
+            {
+                methods = t.GetMethods(flags).Where(m => !m.IsSpecialName
+                    && m.Name.IndexOf("Bundle", StringComparison.OrdinalIgnoreCase) >= 0
+                    && m.Name.IndexOf("Async", StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
+            }
+            catch { continue; }
+
+            foreach (var m in methods)
+            {
+                w.WriteLine("  " + t.FullName + " :: " + FormatMethod(m));
             }
         }
         w.Flush();
@@ -120,10 +127,32 @@ class Program
         catch { return Array.Empty<T>(); }
     }
 
-    static string SafeTypeName(Type t)
+    static string FormatMethod(MethodBase m)
     {
-        if (t == null) return "null";
-        try { return t.ToString(); }
-        catch (Exception ex) { return "<?:" + ex.GetType().Name + ">"; }
+        string ret = "";
+        if (m is MethodInfo mi)
+        {
+            try { ret = mi.ReturnType.ToString(); }
+            catch (Exception ex) { ret = "<?:" + ex.GetType().Name + ">"; }
+        }
+
+        ParameterInfo[] parameters;
+        try
+        {
+            parameters = m.GetParameters();
+        }
+        catch (Exception ex)
+        {
+            return $"{m.Name}(<could not get parameters: {ex.Message}>)";
+        }
+
+        var parts = new List<string>();
+        foreach (var p in parameters)
+        {
+            try { parts.Add(p.ParameterType + " " + p.Name); }
+            catch (Exception ex) { parts.Add("<?:" + ex.GetType().Name + "> " + (p.Name ?? "?")); }
+        }
+
+        return $"{ret} {m.Name}({string.Join(", ", parts)})".Trim();
     }
 }
