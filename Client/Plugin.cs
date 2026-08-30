@@ -99,6 +99,11 @@ namespace SevenBoldPencil.TargetDummies
         public static Plugin Instance;
 		public ManualLogSource LoggerInstance;
 
+		public ConfigEntry<bool> DebugLogging;
+		public ConfigEntry<bool> SpawnUnarmored;
+		public ConfigEntry<bool> ForceWeaponLightsOff;
+		public ConfigEntry<float> SpawnInterval;
+
 		public ConfigEntry<float> Mannequin_Health_Head;
 		public ConfigEntry<float> Mannequin_Health_Chest;
 		public ConfigEntry<float> Mannequin_Health_Stomach;
@@ -111,6 +116,25 @@ namespace SevenBoldPencil.TargetDummies
         {
             Instance = this;
 			LoggerInstance = Logger;
+
+			SpawnUnarmored = Config.Bind<bool>("Mannequin Settings", "Spawn Unarmored", false, new ConfigDescription(
+				"Spawn mannequins with no gear at all, keeping only the melee weapon from your Scabbard slot. "
+				+ "The knife is deliberately kept: a mannequin with completely empty hands has no hands controller, "
+				+ "which makes the game throw a NullReferenceException every frame.",
+				null, new ConfigurationManagerAttributes { Order = 8 }));
+
+			ForceWeaponLightsOff = Config.Bind<bool>("Mannequin Settings", "Force Weapon Lights Off", true, new ConfigDescription(
+				"Turn off weapon flashlights and lasers on mannequins, so a light you happen to be carrying does not blind you downrange.",
+				null, new ConfigurationManagerAttributes { Order = 7 }));
+
+			SpawnInterval = Config.Bind<float>("Mannequin Settings", "Spawn Interval", 0.5f, new ConfigDescription(
+				"Seconds to wait between spawning one mannequin and the next, and before a killed mannequin respawns. "
+				+ "Lower is faster but spawns more work into a single frame.",
+				new AcceptableValueRange<float>(0.1f, 5f), new ConfigurationManagerAttributes { Order = 6 }));
+
+			DebugLogging = Config.Bind<bool>("Debug", "Debug Logging", false, new ConfigDescription(
+				"Log every spawn step in detail. Leave off unless you are diagnosing a problem - it is noisy.",
+				null, new ConfigurationManagerAttributes { Order = 1 }));
 
 			Mannequin_Health_Head = Config.Bind<float>("Mannequin Settings", "Health Head", 35, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 5 }));
 			Mannequin_Health_Chest = Config.Bind<float>("Mannequin Settings", "Health Chest", 85, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 4 }));
@@ -351,7 +375,7 @@ namespace SevenBoldPencil.TargetDummies
 				TrySetEmptyHands(botPlayer);
 			}
 
-			Logger.LogWarning($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position}.");
+			DebugLog($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position}.");
 
 			}
 			catch (Exception e)
@@ -410,7 +434,7 @@ namespace SevenBoldPencil.TargetDummies
 						continue;
 					}
 
-					Logger.LogWarning($"Destroying the half-constructed player object LocalPlayer.Create left behind ('{player.name}'), to stop its per-frame LateUpdate NullReferenceExceptions.");
+					DebugLog($"Destroying the half-constructed player object LocalPlayer.Create left behind ('{player.name}'), to stop its per-frame LateUpdate NullReferenceExceptions.");
 
 					// Both of these routinely throw on a body that was never finished being built -
 					// that is the whole point of the cleanup, so neither failure should stop the other.
@@ -592,6 +616,8 @@ namespace SevenBoldPencil.TargetDummies
 			// Clone whatever the player is actually carrying. Bounded by both arrays: the two profiles
 			// are not guaranteed to declare the same number of equipment slots, and indexing past the
 			// end would throw ArgumentOutOfRangeException.
+			bool unarmored = SpawnUnarmored.Value;
+
 			int slotCount = Math.Min(profileSlots.Length, playerSlots.Length);
 			for (var i = 0; i < slotCount; i++)
 			{
@@ -601,9 +627,24 @@ namespace SevenBoldPencil.TargetDummies
 					continue;
 				}
 
+				// In unarmored mode the mannequin keeps only its melee weapon. Empty hands are not an
+				// option: a mannequin with no hands controller makes the game throw a
+				// NullReferenceException out of MouseLook every single frame.
+				if (unarmored && !IsScabbardSlot(playerSlots[i]))
+				{
+					continue;
+				}
+
 				try
 				{
-					profileSlots[i].ChangeContainedItemDirectly(originalItem.CloneItem());
+					var clonedItem = originalItem.CloneItem();
+
+					if (ForceWeaponLightsOff.Value)
+					{
+						TurnOffLights(clonedItem);
+					}
+
+					profileSlots[i].ChangeContainedItemDirectly(clonedItem);
 				}
 				catch (Exception ex)
 				{
@@ -612,6 +653,95 @@ namespace SevenBoldPencil.TargetDummies
 			}
 
 			return profile;
+		}
+
+		/// <summary>True if this is the melee slot - the one item kept in unarmored mode.</summary>
+		private static bool IsScabbardSlot(Slot slot)
+		{
+			try
+			{
+				return string.Equals(slot?.ID, "Scabbard", StringComparison.OrdinalIgnoreCase);
+			}
+			catch
+			{
+				return false;
+			}
+		}
+
+		/// <summary>
+		/// Switches off every flashlight and laser on an item and its attachments, so a mannequin
+		/// built from a weapon you happen to be carrying does not shine it back down the range.
+		/// </summary>
+		/// <remarks>
+		/// Reflection-based on purpose: LightComponent and its active flag are resolved by name, so
+		/// this degrades to a logged no-op on a build where they differ rather than failing to
+		/// compile or throwing into the spawn path.
+		/// </remarks>
+		private void TurnOffLights(Item item)
+		{
+			if (item == null)
+			{
+				return;
+			}
+
+			try
+			{
+				var lightComponentType = typeof(Item).Assembly.GetType("EFT.InventoryLogic.LightComponent");
+				if (lightComponentType == null)
+				{
+					return;
+				}
+
+				var getComponents = typeof(Item)
+					.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+					.FirstOrDefault(m => m.Name == "GetItemComponentsInChildren"
+						&& m.IsGenericMethodDefinition
+						&& m.GetParameters().Length <= 1);
+
+				if (getComponents == null)
+				{
+					DebugLog("Item.GetItemComponentsInChildren was not found; weapon lights cannot be switched off.");
+					return;
+				}
+
+				var closed = getComponents.MakeGenericMethod(lightComponentType);
+				var args = closed.GetParameters().Length == 1 ? new object[] { true } : Array.Empty<object>();
+
+				if (closed.Invoke(item, args) is not IEnumerable components)
+				{
+					return;
+				}
+
+				foreach (var component in components)
+				{
+					if (component == null)
+					{
+						continue;
+					}
+
+					// The flag is IsActive on current builds; SetLightState/IsOn have been used too.
+					var flag = component.GetType().GetProperty("IsActive", BindingFlags.Public | BindingFlags.Instance)
+						?? component.GetType().GetProperty("IsOn", BindingFlags.Public | BindingFlags.Instance);
+
+					if (flag != null && flag.CanWrite && flag.PropertyType == typeof(bool))
+					{
+						flag.SetValue(component, false);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				DebugLog($"Could not switch off weapon lights: {ex.GetType().Name}: {ex.Message}");
+			}
+		}
+
+		/// <summary>Logs only when the F12 "Debug Logging" toggle is on.</summary>
+		public void DebugLog(string message)
+		{
+			if (DebugLogging != null && DebugLogging.Value)
+			{
+				Logger.LogWarning(message);
+			}
 		}
 
 		public async Task<Profile> GenerateProfile(ISession session, Profile playerProfile, MannequinType mannequinType)
@@ -1000,6 +1130,7 @@ namespace SevenBoldPencil.TargetDummies
 			foreach (var data in new[] { closeLeft, closeMiddle, closeRight, farLeft, farMiddle, farRight })
 			{
 				yield return WaitForTaskOrTimeout(SpawnBot(data), 120f);
+				yield return new WaitForSeconds(SpawnInterval.Value);
 			}
 		}
 
@@ -1030,12 +1161,12 @@ namespace SevenBoldPencil.TargetDummies
 				yield break;
 			}
 
-			yield return new WaitForSeconds(0.5f);
+			yield return new WaitForSeconds(SpawnInterval.Value);
 
 			bot.Dispose();
 			AssetPoolObject.ReturnToPool(bot.gameObject, true);
 
-			yield return new WaitForSeconds(0.5f);
+			yield return new WaitForSeconds(SpawnInterval.Value);
 
 			SpawnBot(mannequinData);
 		}
