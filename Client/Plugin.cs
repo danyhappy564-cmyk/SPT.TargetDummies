@@ -534,6 +534,18 @@ namespace SevenBoldPencil.TargetDummies
 		{
 			var profileDescriptor = GenerateMannequinProfile();
 
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - the hardcoded Voice customization id
+			// in GenerateDefaultCustomization ("5fc613c80b735e7b024c76e2") maps to a bundle
+			// ("assets/content/audio/phrases/scav_1_voice.bundle") that this SPT server never
+			// serves, so LocalPlayer.Create throws "...is not loaded" on every single mannequin
+			// spawn, aborting construction before health/AI wiring finishes (the mannequin still
+			// visibly spawns - confirmed a half-built character stays in the scene - but never
+			// reacts to hits or dies). The player's own Voice id is guaranteed loadable since the
+			// player is already using it live, so use that instead - same trick already applied to
+			// Feet below. Applied before the early-return fallbacks so it takes effect even when
+			// there's no mannequin gear to clone.
+			profileDescriptor.Customization[EBodyModelPart.Voice] = playerProfile.Customization[EBodyModelPart.Voice];
+
 			if (!playerProfile.Inventory.HideoutAreaStashes.TryGetValue(EAreaType.EquipmentPresetsStand, out var equipmentPresetsStand))
 			{
 				return new(profileDescriptor);
