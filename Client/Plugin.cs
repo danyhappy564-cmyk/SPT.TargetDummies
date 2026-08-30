@@ -167,6 +167,10 @@ namespace SevenBoldPencil.TargetDummies
 
 		public async Task SpawnBot(MannequinData data)
 		{
+			// Declared out here so the catch below can still see it - it is filled in just before
+			// LocalPlayer.Create, and used to clean up a half-built body if that call throws.
+			HashSet<LocalPlayer> playersBeforeCreate = null;
+
 			try
 			{
 
@@ -248,6 +252,16 @@ namespace SevenBoldPencil.TargetDummies
 			// removed: it doesn't help (the file still isn't there) and reusing the same profile/id
 			// across attempts risked LocalPlayer.Create hanging instead of throwing again. A failure
 			// here is caught by SpawnBot's own try/catch below and just skips this one mannequin.
+			// PORTING NOTE (SPT 4.0.13): if LocalPlayer.Create throws partway through, the Player
+			// GameObject it had already instantiated is left behind in the scene, half-wired. Unity
+			// keeps calling its LateUpdate every frame, and EFT.Player.ComplexLateUpdate immediately
+			// NullReferences on the components Create never got around to setting - flooding the
+			// log with a NullReferenceException per orphan per frame (confirmed in-game: tens of
+			// thousands of lines, plus "PlayerBody destroyed without being disposed" on teardown)
+			// and dragging the framerate down for the rest of the session. Snapshot the live Player
+			// objects first so the catch below can destroy whatever Create orphaned.
+			playersBeforeCreate = new HashSet<LocalPlayer>(UnityEngine.Object.FindObjectsOfType<LocalPlayer>());
+
 			LocalPlayer botPlayer;
 			using (SuppressDisableDevMaskCheckPatch())
 			{
@@ -309,6 +323,46 @@ namespace SevenBoldPencil.TargetDummies
 			catch (Exception e)
 			{
 				Logger.LogError(e);
+				DestroyOrphanedPlayers(playersBeforeCreate);
+			}
+		}
+
+		/// <summary>
+		/// Destroys any <see cref="Player"/> that appeared since <paramref name="playersBeforeCreate"/>
+		/// was captured. Called only when <c>LocalPlayer.Create</c> threw, to clean up the
+		/// half-constructed body it left in the scene - see the porting note at the snapshot site.
+		/// </summary>
+		private void DestroyOrphanedPlayers(HashSet<LocalPlayer> playersBeforeCreate)
+		{
+			if (playersBeforeCreate == null)
+			{
+				return;
+			}
+
+			try
+			{
+				foreach (var player in UnityEngine.Object.FindObjectsOfType<LocalPlayer>())
+				{
+					// Skip anything that already existed, and any mannequin that spawned fine.
+					if (player == null || playersBeforeCreate.Contains(player) || Mannequins.ContainsKey(player))
+					{
+						continue;
+					}
+
+					Logger.LogWarning($"Destroying the half-constructed player object LocalPlayer.Create left behind ('{player.name}'), to stop its per-frame LateUpdate NullReferenceExceptions.");
+
+					// Both of these routinely throw on a body that was never finished being built -
+					// that is the whole point of the cleanup, so neither failure should stop the other.
+					try { player.Dispose(); }
+					catch (Exception ex) { Logger.LogDebug($"Dispose() on the orphaned player threw (expected): {ex.Message}"); }
+
+					try { UnityEngine.Object.Destroy(player.gameObject); }
+					catch (Exception ex) { Logger.LogWarning($"Destroy() on the orphaned player threw: {ex.Message}"); }
+				}
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not clean up orphaned player objects: {ex.Message}");
 			}
 		}
 
@@ -400,21 +454,28 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			// PORTING NOTE (SPT 4.0.13): confirmed via errors.log on non-Mannequin (real
-			// WildSpawnType, e.g. Scav/Tagilla) profiles - the flat 5s wait below was tuned for
-			// Mannequin profiles (~5-6 bundles, already cached from the player's own hideout gear).
-			// Real bot profiles carry full randomized loadouts (~20-40+ bundles: weapon, mods,
-			// ammo, clothing, voice), and several of those (boss-specific weapon mods, voice lines)
-			// 404 permanently on this server - so the whole-batch wait still never resolves to
-			// Succeed, same as always. Unlike the Mannequin case though, the character mesh bundles
-			// themselves (head/body/hands) are legitimate always-present assets that simply hadn't
-			// finished loading yet within 5s among the larger mixed batch, causing
-			// "<head bundle> is not loaded" mid-construction - a fully invisible character, not
-			// just missing gear/voice.
+			// PORTING NOTE (SPT 4.0.13): this used to issue ONE LoadBundlesAsync call for the whole
+			// profile and wait on the single returned IOperation. Confirmed in-game that this is
+			// the root cause of bodyless/invisible bots: one unreachable bundle anywhere in the
+			// batch stops the WHOLE batch from ever reporting Succeed, and - critically - the good
+			// bundles in that same batch never get committed as loaded either. The decisive
+			// evidence was a batch of just FOUR character-mesh bundles timing out after a full 20s,
+			// immediately followed by "wild_head_1.bundle is not loaded" from LocalPlayer.Create -
+			// a 4-bundle batch cannot possibly be a bandwidth or batch-size problem, and the head
+			// bundle itself never once 404s in the game's errors.log. It was being held hostage by
+			// whichever sibling in its batch was unreachable.
 			//
-			// Fix: load the character-mesh bundles in their own small batch first and wait for
-			// THAT to fully succeed (never contains a permanently-missing entry, so it reliably
-			// completes) before touching the large mixed batch with the old short timeout.
+			// Mannequin1/2/3 profiles never hit this because they clone the player's own hideout
+			// display gear, which the hideout scene has already loaded - the preload was a no-op
+			// there, so the batch behaviour never mattered. Real WildSpawnType profiles (Scav,
+			// Tagilla, Shturman) load everything cold and always carry at least one genuinely
+			// missing bundle (boss weapon mods, voice lines), so every one of their spawns was
+			// poisoned.
+			//
+			// Fix: give each bundle its own LoadBundlesAsync operation. They still run
+			// concurrently, so the good ones finish just as fast as before, but an unreachable
+			// bundle now only ever stalls its own operation - it can no longer prevent the
+			// character's head/body/hands from being committed as loaded.
 			bool IsCharacterMeshBundle(string name) =>
 				name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0 ||
 				name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -423,76 +484,96 @@ namespace SevenBoldPencil.TargetDummies
 			var meshBundleNames = bundleNames.Where(IsCharacterMeshBundle).ToArray();
 			var otherBundleNames = bundleNames.Where(name => !IsCharacterMeshBundle(name)).ToArray();
 
-			Logger.LogWarning($"Preloading {bundleNames.Length} bundle names for mannequin profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundleNames.Length} other={otherBundleNames.Length}. Sample: {string.Join(" | ", bundleNames.Take(10))}");
+			Logger.LogWarning($"Preloading {bundleNames.Length} bundles individually for profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundleNames.Length} other={otherBundleNames.Length}.");
 
-			if (meshBundleNames.Length > 0)
-			{
-				var meshOperation = assetsManager.LoadBundlesAsync(meshBundleNames);
-				var meshTcs = new TaskCompletionSource<bool>();
-				StartCoroutine(DriveOperationCoroutine(meshOperation, meshTcs));
+			// Mesh bundles decide whether the character has a body at all, so they get the longer
+			// wait and per-bundle reporting. Everything else (weapons, rig, ammo) only affects
+			// cosmetic gear, so it gets a short wait and is allowed to lag behind.
+			await LoadBundlesIndividuallyAsync(meshBundleNames, 20, "character mesh", profile.Id, logEachFailure: true);
+			await LoadBundlesIndividuallyAsync(otherBundleNames, 5, "gear", profile.Id, logEachFailure: false);
+		}
 
-				const double meshTimeoutSeconds = 20;
-				var meshWaitStart = DateTime.UtcNow;
-				while (true)
-				{
-					var completed = await Task.WhenAny(meshTcs.Task, Task.Delay(TimeSpan.FromSeconds(1)));
-					if (completed == meshTcs.Task)
-					{
-						break;
-					}
-
-					if ((DateTime.UtcNow - meshWaitStart).TotalSeconds >= meshTimeoutSeconds)
-					{
-						Logger.LogWarning($"Character mesh bundle preload timed out for profile {profile.Id} after {meshTimeoutSeconds}s; proceeding anyway (character may be invisible).");
-						break;
-					}
-				}
-			}
-
-			if (otherBundleNames.Length == 0)
+		/// <summary>
+		/// Issues one <c>LoadBundlesAsync</c> operation per bundle name, all concurrently, and waits
+		/// up to <paramref name="timeoutSeconds"/> for them to settle. Isolating each bundle in its
+		/// own operation is deliberate - see the porting note in
+		/// <see cref="PreloadProfileBundlesAsync"/>: a shared batch lets one unreachable bundle
+		/// prevent every other bundle in it from being committed as loaded.
+		/// </summary>
+		private async Task LoadBundlesIndividuallyAsync(
+			string[] bundleNames,
+			double timeoutSeconds,
+			string label,
+			string profileId,
+			bool logEachFailure)
+		{
+			if (bundleNames.Length == 0)
 			{
 				return;
 			}
 
-			var operation = assetsManager.LoadBundlesAsync(otherBundleNames);
-
-			var tcs = new TaskCompletionSource<bool>();
-			StartCoroutine(DriveOperationCoroutine(operation, tcs));
-
-			// PORTING NOTE (SPT 4.0.13): confirmed in-game - waiting for the WHOLE batch to report
-			// Succeed==true never worked reliably in this modded environment, even with as few as
-			// 5 bundles requested (a fixed mannequin skin, no random gear at all). Every single
-			// spawn hits the same shape: most bundles resolve almost immediately, and one or more
-			// (a voice/animation-bank reference like "BossTagilla.bundle", or a boss-specific
-			// weapon-mod bundle absent from this server, with no consistent naming pattern to
-			// filter on - unlike the audio/ path ones already excluded above) never resolve no
-			// matter how long the wait. The batch operation appears to never resolve to Succeed OR
-			// Failed if even one bundle in it is permanently unreachable - it just hangs until an
-			// external caller gives up. Character mesh bundles are handled separately above with
-			// their own reliable wait, so this short timeout now only affects non-essential gear/
-			// weapon/voice bundles - missing ones there degrade to missing gear visuals, not an
-			// invisible character.
-			const double timeoutSeconds = 5;
-			var waitStart = DateTime.UtcNow;
-			while (true)
+			var assetsManager = AssetsManagerSingletonClass.Manager;
+			if (assetsManager == null)
 			{
-				var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(1)));
-				if (completed == tcs.Task)
+				return;
+			}
+
+			var pending = new List<PendingBundleLoad>(bundleNames.Length);
+			foreach (var name in bundleNames)
+			{
+				try
 				{
-					break;
+					var load = new PendingBundleLoad
+					{
+						Name = name,
+						Tcs = new TaskCompletionSource<bool>(),
+					};
+					load.Operation = assetsManager.LoadBundlesAsync(new[] { name });
+					StartCoroutine(DriveOperationCoroutine(load.Operation, load.Tcs));
+					pending.Add(load);
 				}
+				catch (Exception ex)
+				{
+					Logger.LogWarning($"Could not start a {label} bundle load for '{name}': {ex.Message}");
+				}
+			}
+
+			var allSettled = Task.WhenAll(pending.Select(p => p.Tcs.Task));
+			var waitStart = DateTime.UtcNow;
+			while (!allSettled.IsCompleted)
+			{
+				await Task.WhenAny(allSettled, Task.Delay(TimeSpan.FromMilliseconds(250)));
 
 				if ((DateTime.UtcNow - waitStart).TotalSeconds >= timeoutSeconds)
 				{
-					Logger.LogWarning($"Bundle preload timed out for mannequin profile {profile.Id}; proceeding anyway.");
-					return;
+					break;
 				}
 			}
 
-			if (!operation.Succeed)
+			var stuck = pending.Where(p => !p.Tcs.Task.IsCompleted).Select(p => p.Name).ToArray();
+			var failed = pending.Where(p => p.Tcs.Task.IsCompleted && !p.Operation.Succeed).Select(p => p.Name).ToArray();
+
+			if (stuck.Length > 0 || failed.Length > 0)
 			{
-				Logger.LogWarning($"Bundle preload did not succeed for mannequin profile {profile.Id} (Failed={operation.Failed} Error={operation.Error}); proceeding anyway.");
+				if (logEachFailure)
+				{
+					Logger.LogWarning(
+						$"{label} bundles for profile {profileId}: {pending.Count - stuck.Length - failed.Length}/{pending.Count} loaded. " +
+						$"Never settled: [{string.Join(", ", stuck)}]. Failed: [{string.Join(", ", failed)}]. Proceeding anyway.");
+				}
+				else
+				{
+					Logger.LogWarning($"{label} bundles for profile {profileId}: {pending.Count - stuck.Length - failed.Length}/{pending.Count} loaded ({stuck.Length} never settled, {failed.Length} failed). Proceeding anyway.");
+				}
 			}
+		}
+
+		/// <summary>One in-flight single-bundle load started by <see cref="LoadBundlesIndividuallyAsync"/>.</summary>
+		private sealed class PendingBundleLoad
+		{
+			public string Name;
+			public IOperation Operation;
+			public TaskCompletionSource<bool> Tcs;
 		}
 
 		private static IEnumerator DriveOperationCoroutine(IOperation operation, TaskCompletionSource<bool> tcs)
