@@ -88,9 +88,17 @@ namespace SevenBoldPencil.TargetDummies
 		Partisan,
 	}
 
+	public enum MannequinPose
+	{
+		Standing,
+		Crouching,
+		Prone,
+	}
+
 	public readonly record struct MannequinData
 	(
-		Vector3 Position
+		Vector3 Position,
+		ConfigEntry<MannequinPose> Pose
 	);
 
     [BepInPlugin("7Bpencil.TargetDummies", "7Bpencil.TargetDummies", "0.2.1")]
@@ -103,6 +111,10 @@ namespace SevenBoldPencil.TargetDummies
 		public ConfigEntry<bool> SpawnUnarmored;
 		public ConfigEntry<bool> ForceWeaponLightsOff;
 		public ConfigEntry<float> SpawnInterval;
+		public ConfigEntry<string> FallbackMeleeTemplateId;
+
+		public ConfigEntry<MannequinPose> CloseRowPose;
+		public ConfigEntry<MannequinPose> FarRowPose;
 
 		public ConfigEntry<float> Mannequin_Health_Head;
 		public ConfigEntry<float> Mannequin_Health_Chest;
@@ -131,6 +143,18 @@ namespace SevenBoldPencil.TargetDummies
 				"Seconds to wait between spawning one mannequin and the next, and before a killed mannequin respawns. "
 				+ "Lower is faster but spawns more work into a single frame.",
 				new AcceptableValueRange<float>(0.1f, 5f), new ConfigurationManagerAttributes { Order = 6 }));
+
+			FallbackMeleeTemplateId = Config.Bind<string>("Mannequin Settings", "Fallback Melee Template Id", "54491bb74bdc2d09088b4567", new ConfigDescription(
+				"Item template id given to an unarmored mannequin when you are not carrying a melee weapon yourself. "
+				+ "Something has to be in its hands - empty hands mean no hands controller, which throws a "
+				+ "NullReferenceException every frame. Change this if the default does not resolve on your install.",
+				null, new ConfigurationManagerAttributes { Order = 5 }));
+
+			CloseRowPose = Config.Bind<MannequinPose>("Close", "Pose", MannequinPose.Standing, new ConfigDescription(
+				"Pose for all three mannequins in the near row.", null, new ConfigurationManagerAttributes { Order = 1 }));
+
+			FarRowPose = Config.Bind<MannequinPose>("Far", "Pose", MannequinPose.Standing, new ConfigDescription(
+				"Pose for all three mannequins in the far row.", null, new ConfigurationManagerAttributes { Order = 1 }));
 
 			DebugLogging = Config.Bind<bool>("Debug", "Debug Logging", false, new ConfigDescription(
 				"Log every spawn step in detail. Leave off unless you are diagnosing a problem - it is noisy.",
@@ -375,13 +399,101 @@ namespace SevenBoldPencil.TargetDummies
 				TrySetEmptyHands(botPlayer);
 			}
 
-			DebugLog($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position}.");
+			ApplyPose(botPlayer, data.Pose.Value);
+
+			DebugLog($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position} ({data.Pose.Value}).");
 
 			}
 			catch (Exception e)
 			{
 				Logger.LogError(e);
 				DestroyOrphanedPlayers(playersBeforeCreate);
+			}
+		}
+
+		/// <summary>
+		/// Puts a spawned mannequin into the configured stance.
+		/// </summary>
+		/// <remarks>
+		/// Reflection-based: MovementContext's pose members are obfuscated differently between
+		/// builds, so each candidate is probed by name and a miss degrades to a debug line rather
+		/// than breaking the build or throwing into the spawn path.
+		/// </remarks>
+		private void ApplyPose(LocalPlayer botPlayer, MannequinPose pose)
+		{
+			try
+			{
+				var movementContext = botPlayer.GetType()
+					.GetProperty("MovementContext", BindingFlags.Public | BindingFlags.Instance)
+					?.GetValue(botPlayer);
+
+				if (movementContext == null)
+				{
+					DebugLog("Player.MovementContext was not found; mannequin pose left as spawned.");
+					return;
+				}
+
+				var contextType = movementContext.GetType();
+
+				if (pose == MannequinPose.Prone)
+				{
+					// Prone is a separate state from the standing/crouching pose level.
+					var setProne = contextType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+						.FirstOrDefault(m => (m.Name == "SetProne" || m.Name == "TryProne")
+							&& m.GetParameters().Length <= 1);
+
+					if (setProne != null)
+					{
+						var args = setProne.GetParameters().Length == 1 ? new object[] { true } : Array.Empty<object>();
+						setProne.Invoke(movementContext, args);
+						return;
+					}
+
+					var proneFlag = contextType.GetProperty("IsInPronePose", BindingFlags.Public | BindingFlags.Instance);
+					if (proneFlag != null && proneFlag.CanWrite)
+					{
+						proneFlag.SetValue(movementContext, true);
+						return;
+					}
+
+					DebugLog("No prone member found on MovementContext; mannequin left standing.");
+					return;
+				}
+
+				// 1 is fully upright, 0 is fully crouched.
+				float poseLevel = pose == MannequinPose.Crouching ? 0f : 1f;
+
+				var setPoseLevel = contextType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+					.FirstOrDefault(m => m.Name == "SetPoseLevel"
+						&& m.GetParameters().Length >= 1
+						&& m.GetParameters()[0].ParameterType == typeof(float));
+
+				if (setPoseLevel != null)
+				{
+					var parameters = setPoseLevel.GetParameters();
+					var args = new object[parameters.Length];
+					args[0] = poseLevel;
+					for (int i = 1; i < parameters.Length; i++)
+					{
+						args[i] = parameters[i].HasDefaultValue ? parameters[i].DefaultValue : (object)true;
+					}
+
+					setPoseLevel.Invoke(movementContext, args);
+					return;
+				}
+
+				var poseProperty = contextType.GetProperty("PoseLevel", BindingFlags.Public | BindingFlags.Instance);
+				if (poseProperty != null && poseProperty.CanWrite)
+				{
+					poseProperty.SetValue(movementContext, poseLevel);
+					return;
+				}
+
+				DebugLog("No pose-level member found on MovementContext; mannequin pose left as spawned.");
+			}
+			catch (Exception ex)
+			{
+				DebugLog($"Could not set mannequin pose to {pose}: {ex.GetType().Name}: {ex.Message}");
 			}
 		}
 
@@ -592,7 +704,15 @@ namespace SevenBoldPencil.TargetDummies
 		/// </remarks>
 		public Profile GenerateProfileFromPlayerLoadout(Profile playerProfile)
 		{
-			var profileDescriptor = GenerateMannequinProfile();
+			bool unarmored = SpawnUnarmored.Value;
+
+			// Only inject a stand-in melee when it is actually needed: unarmored mode, and the player
+			// has nothing in their own Scabbard for the mannequin to copy.
+			string fallbackMelee = unarmored && FindScabbardItem(playerProfile) == null
+				? FallbackMeleeTemplateId.Value
+				: null;
+
+			var profileDescriptor = GenerateMannequinProfile(fallbackMelee);
 
 			// Take the player's whole appearance - head, body, hands, feet, voice. Every one of these
 			// bundles is guaranteed loadable because the player is standing in the hideout wearing them.
@@ -616,8 +736,6 @@ namespace SevenBoldPencil.TargetDummies
 			// Clone whatever the player is actually carrying. Bounded by both arrays: the two profiles
 			// are not guaranteed to declare the same number of equipment slots, and indexing past the
 			// end would throw ArgumentOutOfRangeException.
-			bool unarmored = SpawnUnarmored.Value;
-
 			int slotCount = Math.Min(profileSlots.Length, playerSlots.Length);
 			for (var i = 0; i < slotCount; i++)
 			{
@@ -653,6 +771,26 @@ namespace SevenBoldPencil.TargetDummies
 			}
 
 			return profile;
+		}
+
+		/// <summary>The player's own melee weapon, or null if they are not carrying one.</summary>
+		private static Item FindScabbardItem(Profile playerProfile)
+		{
+			var slots = playerProfile?.Inventory?.Equipment?.Slots;
+			if (slots == null)
+			{
+				return null;
+			}
+
+			foreach (var slot in slots)
+			{
+				if (IsScabbardSlot(slot))
+				{
+					return slot.ContainedItem;
+				}
+			}
+
+			return null;
 		}
 
 		/// <summary>True if this is the melee slot - the one item kept in unarmored mode.</summary>
@@ -869,7 +1007,7 @@ namespace SevenBoldPencil.TargetDummies
 		// version (AccountId, Skills, Hideout, Stats, TradersInfo, ...), all left at their C# default
 		// (null) since this mod's original code never set them either - only Id/Info/Customization/
 		// Health/Inventory are populated below.
-		public CompleteProfileDescriptorClass GenerateMannequinProfile()
+		public CompleteProfileDescriptorClass GenerateMannequinProfile(string fallbackMeleeTemplateId = null)
 		{
 			return new()
 			{
@@ -877,7 +1015,7 @@ namespace SevenBoldPencil.TargetDummies
 				Info = new(),
 				Customization = GenerateDefaultCustomization(),
 				Health = GenerateDefaultHealth(),
-				Inventory = GenerateDefaultInventory(),
+				Inventory = GenerateDefaultInventory(fallbackMeleeTemplateId),
 			};
 		}
 
@@ -959,15 +1097,34 @@ namespace SevenBoldPencil.TargetDummies
 		// profile.Inventory.Equipment.Slots by position to clone the player's real mannequin gear,
 		// and an empty Slots list will throw ArgumentOutOfRangeException there. All 6 config slots
 		// default to MannequinType.Scav, so this only matters if Mannequin1/2/3 is selected.
-		public static EFTInventoryClass GenerateDefaultInventory()
+		public static EFTInventoryClass GenerateDefaultInventory(string fallbackMeleeTemplateId = null)
 		{
 		    var equipment = MongoID.Generate(true);
+
+			var items = new List<FlatItemsDataClass>
+			{
+				new() { _id = equipment, _tpl = "55d7217a4bdc2d86028b456d" },
+			};
+
+			// A mannequin has to be holding something. With completely empty hands it gets no hands
+			// controller, and the game then throws a NullReferenceException out of MouseLook every
+			// single frame. When the player carries no melee weapon of their own to copy, declare one
+			// here as plain flat item data - the same mechanism the equipment item above uses, so no
+			// item-factory call is needed.
+			if (!string.IsNullOrWhiteSpace(fallbackMeleeTemplateId))
+			{
+				items.Add(new FlatItemsDataClass
+				{
+					_id = MongoID.Generate(true),
+					_tpl = fallbackMeleeTemplateId,
+					parentId = equipment,
+					slotId = "Scabbard",
+				});
+			}
+
 			return new()
 			{
-				Gclass1390_0 = new FlatItemsDataClass[]
-				{
-					new() { _id = equipment, _tpl = "55d7217a4bdc2d86028b456d" },
-				},
+				Gclass1390_0 = items.ToArray(),
 				InventoryDescriptorClass = new InventoryDescriptorClass
 				{
 					Id = equipment,
@@ -1102,13 +1259,13 @@ namespace SevenBoldPencil.TargetDummies
 		{
 			yield return new WaitForSeconds(1f);
 
-			var closeLeft = new MannequinData(new(-4f, 0.01f, 16.2f));
-			var closeMiddle = new MannequinData(new(-2.9f, 0.01f, 23.75f));
-			var closeRight = new MannequinData(new(-1.65f, 0.01f, 30.22f));
+			var closeLeft = new MannequinData(new(-4f, 0.01f, 16.2f), CloseRowPose);
+			var closeMiddle = new MannequinData(new(-2.9f, 0.01f, 23.75f), CloseRowPose);
+			var closeRight = new MannequinData(new(-1.65f, 0.01f, 30.22f), CloseRowPose);
 
-			var farLeft = new MannequinData(new(-4.95f, 0.01f, 57.48f));
-			var farMiddle = new MannequinData(new(-2.75f, 0.01f, 57.47f));
-			var farRight = new MannequinData(new(-0.56f, 0.01f, 57.47f));
+			var farLeft = new MannequinData(new(-4.95f, 0.01f, 57.48f), FarRowPose);
+			var farMiddle = new MannequinData(new(-2.75f, 0.01f, 57.47f), FarRowPose);
+			var farRight = new MannequinData(new(-0.56f, 0.01f, 57.47f), FarRowPose);
 
 			// PORTING NOTE (SPT 4.0.13): confirmed in-game - firing all 6 SpawnBot calls at once
 			// (as 4.1's original fire-and-forget code did) makes their bundle preloads compete for
