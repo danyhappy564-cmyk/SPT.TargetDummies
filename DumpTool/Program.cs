@@ -9,9 +9,11 @@ using System.Text;
 // SPT 4.0.13 backport can be fixed against actual signatures instead of guesses. Not part of
 // the mod - delete this project once the backport is done.
 //
-// Targets the 4 symbols the compiler couldn't find on 4.0.13: CorpseRagdoll, Profile.HealthInfo,
-// InventoryDescriptor, ProfileDescriptor. Run with no arguments (defaults to E:\SPT 4.0.10) or
-// pass the SPT root as the first argument. Writes dump.txt next to the exe.
+// Round 2: CompleteProfileDescriptorClass (Profile's ctor parameter, i.e. 4.1's ProfileDescriptor)
+// has many more fields than the 4.1 mod set, and several of those fields are themselves
+// obfuscated DTOs whose own shape we still need (EFTInventoryClass, ProfileInfoClass, the two
+// nested types inside ProfileHealthClass). Recurses a few levels into "interesting" field types
+// instead of hardcoding names, so this round should surface everything in one pass.
 class Program
 {
     static void Main(string[] args)
@@ -61,6 +63,7 @@ class Program
         }
 
         using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
+        var visited = new HashSet<Type>();
 
         Type profileType = allTypes.FirstOrDefault(t => t.FullName == "EFT.Profile")
             ?? allTypes.FirstOrDefault(t => t.Name == "Profile" && t.Namespace != null && t.Namespace.StartsWith("EFT"));
@@ -71,8 +74,9 @@ class Program
         }
         else
         {
-            w.WriteLine("=== " + profileType.FullName + " constructors ===");
             const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            w.WriteLine("=== " + profileType.FullName + " constructors, recursed 3 levels into descriptor-shaped fields ===");
             foreach (var ctor in SafeGet(() => profileType.GetConstructors(flags)))
             {
                 var pars = SafeGet(() => ctor.GetParameters());
@@ -80,16 +84,15 @@ class Program
 
                 foreach (var p in pars)
                 {
-                    DumpCandidateDescriptor(w, p.ParameterType, indent: "    ");
+                    DumpTypeDeep(w, p.ParameterType, "    ", depth: 3, visited);
                 }
             }
 
             w.WriteLine();
-            w.WriteLine("=== " + profileType.FullName + " nested types ===");
+            w.WriteLine("=== " + profileType.FullName + " nested types (top level only) ===");
             foreach (var nt in SafeGet(() => profileType.GetNestedTypes(flags)))
             {
                 w.WriteLine("  nested: " + nt.FullName);
-                DumpFields(w, nt, "    ");
             }
         }
 
@@ -107,9 +110,10 @@ class Program
                 if ((hasOwner && hasStoppedEvent) || nameMatch)
                 {
                     w.WriteLine("  candidate: " + t.FullName + " (hasOwner=" + hasOwner + ", hasStoppedEvent=" + hasStoppedEvent + ", nameMatch=" + nameMatch + ")");
-                    DumpFields(w, t, "    ");
-                    var methods = SafeGet(() => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly));
-                    foreach (var m in methods.Where(m => m.Name == "Start" || m.Name.Contains("RigidbodyStopped")))
+                    DumpTypeDeep(w, t, "    ", depth: 0, visited: new HashSet<Type>());
+
+                    var candidateMethods = SafeGet(() => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly));
+                    foreach (var m in candidateMethods.Where(m => m.Name == "Start" || m.Name.IndexOf("RigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0))
                     {
                         w.WriteLine("    method: " + m);
                     }
@@ -121,44 +125,106 @@ class Program
             }
         }
 
+        // PlayerBody is the strongest guess for RagdollClass's "_owner" equivalent (RagdollClass
+        // has a PlayerBody_0 field, and _owner.TryGetComponent<LocalPlayer>(...) only compiles if
+        // _owner's type inherits Component.TryGetComponent). Print PlayerBody's base type chain to
+        // confirm it actually is a Component/MonoBehaviour.
+        Type playerBodyType = allTypes.FirstOrDefault(t => t.FullName == "EFT.PlayerBody");
+        if (playerBodyType != null)
+        {
+            w.WriteLine();
+            w.WriteLine("=== EFT.PlayerBody base type chain (confirms whether it has TryGetComponent) ===");
+            for (Type bt = playerBodyType; bt != null; bt = bt.BaseType)
+            {
+                w.WriteLine("  " + bt.FullName);
+            }
+        }
+
         w.Flush();
         Console.WriteLine("Wrote dump.txt");
     }
 
-    // Prints the fields of a ctor parameter type. Its own field dump surfaces any
-    // "descriptor"-shaped sub-fields (e.g. ProfileDescriptor's Inventory field reveals
-    // InventoryDescriptor's rename, and its Health field reveals HealthInfo's, without needing
-    // to guess either separately).
-    static void DumpCandidateDescriptor(StreamWriter w, Type t, string indent)
+    // Recursively dumps ctors/fields/props of a type, following non-system field types (unwrapping
+    // Dictionary<,>'s value type, List<>'s element type, Nullable<>'s underlying type, and arrays)
+    // up to `depth` levels, so obfuscated DTO field types (EFTInventoryClass, ProfileInfoClass,
+    // etc.) surface without needing their names guessed ahead of time. `visited` prevents infinite
+    // recursion on cyclic references (e.g. Profile+Class1413.profile_0 : Profile).
+    static void DumpTypeDeep(StreamWriter w, Type t, string indent, int depth, HashSet<Type> visited)
     {
-        if (t == null)
+        if (t == null || t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(object) || t == typeof(decimal))
         {
             return;
         }
 
-        w.WriteLine(indent + "type: " + t.FullName);
-        DumpFields(w, t, indent + "  ");
-    }
-
-    static void DumpFields(StreamWriter w, Type t, string indent)
-    {
-        try
+        if (!visited.Add(t))
         {
-            var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-            foreach (var f in fields)
-            {
-                w.WriteLine(indent + "field: " + SafeTypeName(f.FieldType) + " " + f.Name);
-            }
-
-            var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-            foreach (var p in props)
-            {
-                w.WriteLine(indent + "prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
-            }
+            w.WriteLine(indent + "type: " + t.FullName + " (already dumped above)");
+            return;
         }
-        catch (Exception ex)
+
+        w.WriteLine(indent + "type: " + t.FullName);
+
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+
+        foreach (var ctor in SafeGet(() => t.GetConstructors(flags)))
         {
-            w.WriteLine(indent + "<error dumping fields: " + ex.Message + ">");
+            var pars = SafeGet(() => ctor.GetParameters());
+            w.WriteLine(indent + "  ctor(" + string.Join(", ", pars.Select(p => SafeTypeName(p.ParameterType) + " " + p.Name)) + ")" + (ctor.IsPublic ? " [public]" : " [non-public]"));
+        }
+
+        var fields = SafeGet(() => t.GetFields(flags));
+        foreach (var f in fields)
+        {
+            w.WriteLine(indent + "  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
+        }
+
+        var props = SafeGet(() => t.GetProperties(flags));
+        foreach (var p in props)
+        {
+            w.WriteLine(indent + "  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
+        }
+
+        if (depth <= 0)
+        {
+            return;
+        }
+
+        var toRecurse = new List<Type>();
+        foreach (var f in fields)
+        {
+            Type ft = f.FieldType;
+
+            if (ft.IsArray)
+            {
+                ft = ft.GetElementType();
+            }
+            else if (ft.IsGenericType)
+            {
+                Type genDef = ft.GetGenericTypeDefinition();
+                Type[] genArgs = ft.GetGenericArguments();
+                if (genDef == typeof(Dictionary<,>)) ft = genArgs[1];
+                else if (genDef == typeof(List<>)) ft = genArgs[0];
+                else if (genDef == typeof(Nullable<>)) ft = genArgs[0];
+                else continue;
+            }
+
+            if (ft == null || ft.IsPrimitive || ft.IsEnum || ft == typeof(string))
+            {
+                continue;
+            }
+
+            if (ft.Namespace != null &&
+                (ft.Namespace.StartsWith("System") || ft.Namespace.StartsWith("Unity") || ft.Namespace.StartsWith("RootMotion")))
+            {
+                continue;
+            }
+
+            toRecurse.Add(ft);
+        }
+
+        foreach (var ft in toRecurse.Distinct())
+        {
+            DumpTypeDeep(w, ft, indent + "  ", depth - 1, visited);
         }
     }
 
