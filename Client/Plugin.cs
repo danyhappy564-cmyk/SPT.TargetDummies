@@ -428,9 +428,14 @@ namespace SevenBoldPencil.TargetDummies
 			// and that worker take a GDelegate62 parameter, a delegate type the CLR refuses to load
 			// ("delegate class must be sealed"), which makes GetParameters() and Invoke() throw. So it
 			// stays uncallable from mod code, and LoadAssetAsync is the reachable equivalent.
+			// ToAssetName() returns backslash-separated paths for some key types and forward-slash
+			// ones for others. Only used for classifying and logging now, but the slashes still have
+			// to be normalised first: without this every "/characters/character/" test below misses,
+			// which is exactly what happened in-game - every profile classified as mesh=0, so the
+			// character meshes landed in the gear bucket and only got its short wait.
 			string SafeAssetName(ResourceKey key)
 			{
-				try { return key.ToAssetName() ?? string.Empty; }
+				try { return key.ToAssetName()?.Replace('\\', '/') ?? string.Empty; }
 				catch { return string.Empty; }
 			}
 
