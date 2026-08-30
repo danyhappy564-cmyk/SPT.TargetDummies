@@ -210,9 +210,9 @@ namespace SevenBoldPencil.TargetDummies
 			// the obfuscated 4.0.13 name, and its equivalent LoadBundlesAndCreatePools has a
 			// malformed callback delegate type the CLR refuses to load from mod code. Same blocker
 			// already solved in spt-hideout-shootout's own 4.0.13 backport: register the Raid pool
-			// category via RegisterPools for capacity, then actually load the bundles through
-			// IAssetsManager.LoadBundlesAsync(string[]), trying every known ResourceKey->string
-			// conversion in turn since which one "works" isn't documented.
+			// category via RegisterPools for capacity, then load the profile's resources through
+			// IAssetsManager.LoadAssetAsync(ResourceKey) - see PreloadProfileBundlesAsync for why
+			// that overload, and not the string-based LoadBundlesAsync, is the working path here.
 			await PreloadProfileBundlesAsync(botPlayerProfile);
 
 			// PORTING NOTE (SPT 4.0.13): HideoutGame/BaseLocalGame<HideoutPlayerOwner> has no method
@@ -405,113 +405,71 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			// PORTING NOTE (SPT 4.0.13): confirmed via DumpTool - IAssetsManager.LoadBundlesAsync
-			// only ever accepted string[], on both 4.1 and here; there's no ResourceKey[]-accepting
-			// overload anywhere to sidestep the string conversion with. ToAssetName() itself is
-			// inconsistent per resource key type - confirmed via the game's own errors.log it
-			// already returns a well-formed, ".bundle"-suffixed, forward-slash path for character
-			// head/body keys, but a backslash-mixed path with NO ".bundle" suffix for clothing/
-			// weapon-mod keys (both get sent as literal HTTP request paths, so the malformed ones
-			// 404 outright). Normalizing every result the same way - forward slashes, ensure a
-			// ".bundle" suffix - fixes both shapes without needing to special-case by key type.
-			string NormalizeBundleName(ResourceKey key)
+			// PORTING NOTE (SPT 4.0.13): this used to hand-convert every ResourceKey to a string
+			// (ToAssetName(), normalised to forward slashes with a ".bundle" suffix) and feed those to
+			// IAssetsManager.LoadBundlesAsync(string[]). Confirmed via DumpTool that this was wrong at
+			// the root: LoadBundlesAsync's IL runs its input through a name transform and then builds
+			// its operation with the mask "{0}:MainAsset", i.e. it wants BUNDLE names, while
+			// ToAssetName() - as the name says - returns an ASSET name. The two are different
+			// namespaces, so the operation was being handed names that resolve to nothing. That is why
+			// it never reported Succeed and never reported Failed either: in-game, with every bundle
+			// isolated in its own operation so no batch could be poisoned by a sibling, 0 of 4
+			// character-mesh bundles settled inside a full 20 second wait, and only already-resident
+			// bundles ever completed.
+			//
+			// AssetsManagerClass/IAssetsManager also expose LoadAssetAsync(ResourceKey) - confirmed via
+			// DumpTool - which takes the ResourceKey the profile already hands us and does the
+			// key -> bundle resolution internally, the way the game does it for itself. That removes the
+			// string conversion (and its per-key-type inconsistencies) from the mod entirely.
+			//
+			// The other candidate was PoolManagerClass.LoadBundlesAndCreatePools, which is what the SPT
+			// 4.1 version of this mod called. Its IL resolves the pool for the category, converts the
+			// keys via Class1448.ConvertResourceInfo, then hands off to an async worker - but both it
+			// and that worker take a GDelegate62 parameter, a delegate type the CLR refuses to load
+			// ("delegate class must be sealed"), which makes GetParameters() and Invoke() throw. So it
+			// stays uncallable from mod code, and LoadAssetAsync is the reachable equivalent.
+			string SafeAssetName(ResourceKey key)
 			{
-				string name;
-				try { name = key.ToAssetName(); }
-				catch { return null; }
-
-				if (string.IsNullOrEmpty(name))
-				{
-					return null;
-				}
-
-				name = name.Replace('\\', '/');
-				if (!name.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase))
-				{
-					name += ".bundle";
-				}
-
-				return name;
+				try { return key.ToAssetName() ?? string.Empty; }
+				catch { return string.Empty; }
 			}
 
-			// PORTING NOTE (SPT 4.0.13): confirmed in-game - voice-line bundles
-			// (assets/content/audio/phrases/*.bundle) never resolve within any timeout tried (15s,
-			// 90s, 110s - all the same), even the player's own live voice id, unlike character mesh/
-			// gear bundles which normally resolve quickly. LocalPlayer.Create tolerates a missing
-			// voice bundle fine (confirmed: mannequins spawn and function correctly without one
-			// preloaded), so waiting on it every single spawn was pure wasted time (most of the
-			// slowness reported between mannequins). Excluded from the preload wait entirely.
-			var bundleNames = resourceKeys
-				.Select(NormalizeBundleName)
-				.Where(name => !string.IsNullOrEmpty(name))
-				.Where(name => name.IndexOf("/audio/", StringComparison.OrdinalIgnoreCase) < 0)
-				.Distinct()
-				.ToArray();
-
-			if (bundleNames.Length == 0)
+			// Asset names are still useful for classifying and logging a key - just not for loading it.
+			bool IsCharacterMeshKey(ResourceKey key)
 			{
-				Logger.LogWarning($"No usable bundle names were produced for mannequin profile {profile.Id}; proceeding anyway.");
-				return;
+				string name = SafeAssetName(key);
+				return name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0
+					|| name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0
+					|| name.IndexOf("/content/feet/", StringComparison.OrdinalIgnoreCase) >= 0;
 			}
 
-			// PORTING NOTE (SPT 4.0.13): this used to issue ONE LoadBundlesAsync call for the whole
-			// profile and wait on the single returned IOperation. Confirmed in-game that this is
-			// the root cause of bodyless/invisible bots: one unreachable bundle anywhere in the
-			// batch stops the WHOLE batch from ever reporting Succeed, and - critically - the good
-			// bundles in that same batch never get committed as loaded either. The decisive
-			// evidence was a batch of just FOUR character-mesh bundles timing out after a full 20s,
-			// immediately followed by "wild_head_1.bundle is not loaded" from LocalPlayer.Create -
-			// a 4-bundle batch cannot possibly be a bandwidth or batch-size problem, and the head
-			// bundle itself never once 404s in the game's errors.log. It was being held hostage by
-			// whichever sibling in its batch was unreachable.
-			//
-			// Mannequin1/2/3 profiles never hit this because they clone the player's own hideout
-			// display gear, which the hideout scene has already loaded - the preload was a no-op
-			// there, so the batch behaviour never mattered. Real WildSpawnType profiles (Scav,
-			// Tagilla, Shturman) load everything cold and always carry at least one genuinely
-			// missing bundle (boss weapon mods, voice lines), so every one of their spawns was
-			// poisoned.
-			//
-			// Fix: give each bundle its own LoadBundlesAsync operation. They still run
-			// concurrently, so the good ones finish just as fast as before, but an unreachable
-			// bundle now only ever stalls its own operation - it can no longer prevent the
-			// character's head/body/hands from being committed as loaded.
-			bool IsCharacterMeshBundle(string name) =>
-				name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0 ||
-				name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0 ||
-				name.IndexOf("/content/feet/", StringComparison.OrdinalIgnoreCase) >= 0;
+			var meshKeys = resourceKeys.Where(IsCharacterMeshKey).ToArray();
+			var otherKeys = resourceKeys.Where(key => !IsCharacterMeshKey(key)).ToArray();
 
-			var meshBundleNames = bundleNames.Where(IsCharacterMeshBundle).ToArray();
-			var otherBundleNames = bundleNames.Where(name => !IsCharacterMeshBundle(name)).ToArray();
+			Logger.LogWarning($"Preloading {resourceKeys.Length} resource keys for profile {profile.Id}; mesh={meshKeys.Length} other={otherKeys.Length}.");
 
-			Logger.LogWarning($"Preloading {bundleNames.Length} bundles individually for profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundleNames.Length} other={otherBundleNames.Length}.");
-
-			// PORTING NOTE (SPT 4.0.13): the waits used to be 20s for mesh and 5s for gear. Confirmed
-			// in-game that waiting longer buys nothing at all: with every bundle isolated in its own
-			// operation, 0 of 4 character-mesh bundles settled within a full 20s, and they report
-			// neither Succeed nor Failed - they simply never finish. Only bundles that were already
-			// resident complete (3 of 27 gear bundles, instantly). So LoadBundlesAsync is not a
-			// working load path in the hideout at all, and the long wait was costing 25s per bot for
-			// nothing. Kept short purely so the per-bundle diagnostics still get logged.
-			await LoadBundlesIndividuallyAsync(meshBundleNames, 3, "character mesh", profile.Id, logEachFailure: true);
-			await LoadBundlesIndividuallyAsync(otherBundleNames, 2, "gear", profile.Id, logEachFailure: false);
+			// Mesh keys decide whether the character has a body at all, so they get the longer wait and
+			// per-key reporting. Gear (weapons, rig, ammo) is cosmetic here and may lag behind.
+			await LoadResourceKeysAsync(meshKeys, 15, "character mesh", profile.Id, SafeAssetName, logEachFailure: true);
+			await LoadResourceKeysAsync(otherKeys, 5, "gear", profile.Id, SafeAssetName, logEachFailure: false);
 		}
 
 		/// <summary>
-		/// Issues one <c>LoadBundlesAsync</c> operation per bundle name, all concurrently, and waits
-		/// up to <paramref name="timeoutSeconds"/> for them to settle. Isolating each bundle in its
-		/// own operation is deliberate - see the porting note in
-		/// <see cref="PreloadProfileBundlesAsync"/>: a shared batch lets one unreachable bundle
-		/// prevent every other bundle in it from being committed as loaded.
+		/// Issues one <c>LoadAssetAsync(ResourceKey)</c> operation per key, all concurrently, and
+		/// waits up to <paramref name="timeoutSeconds"/> for them to settle. Loading by ResourceKey
+		/// rather than by hand-built bundle name is the point - see the porting note in
+		/// <see cref="PreloadProfileBundlesAsync"/>. Per-key operations also mean an unreachable
+		/// resource only ever stalls itself.
 		/// </summary>
-		private async Task LoadBundlesIndividuallyAsync(
-			string[] bundleNames,
+		private async Task LoadResourceKeysAsync(
+			ResourceKey[] keys,
 			double timeoutSeconds,
 			string label,
 			string profileId,
+			Func<ResourceKey, string> describe,
 			bool logEachFailure)
 		{
-			if (bundleNames.Length == 0)
+			if (keys.Length == 0)
 			{
 				return;
 			}
@@ -522,23 +480,27 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			var pending = new List<PendingBundleLoad>(bundleNames.Length);
-			foreach (var name in bundleNames)
+			var pending = new List<PendingBundleLoad>(keys.Length);
+			foreach (var key in keys)
 			{
 				try
 				{
 					var load = new PendingBundleLoad
 					{
-						Name = name,
+						Name = describe(key),
 						Tcs = new TaskCompletionSource<bool>(),
 					};
-					load.Operation = assetsManager.LoadBundlesAsync(new[] { name });
-					StartCoroutine(DriveOperationCoroutine(load.Operation, load.Tcs));
+
+					// Held as object so this compiles regardless of whether IOperation<T> derives from
+					// the non-generic IOperation - see OperationSucceeded below.
+					var operation = assetsManager.LoadAssetAsync(key);
+					load.Operation = operation;
+					StartCoroutine(DriveOperationCoroutine(operation, load.Tcs));
 					pending.Add(load);
 				}
 				catch (Exception ex)
 				{
-					Logger.LogWarning($"Could not start a {label} bundle load for '{name}': {ex.Message}");
+					Logger.LogWarning($"Could not start a {label} load for '{describe(key)}': {ex.Message}");
 				}
 			}
 
@@ -555,35 +517,78 @@ namespace SevenBoldPencil.TargetDummies
 			}
 
 			var stuck = pending.Where(p => !p.Tcs.Task.IsCompleted).Select(p => p.Name).ToArray();
-			var failed = pending.Where(p => p.Tcs.Task.IsCompleted && !p.Operation.Succeed).Select(p => p.Name).ToArray();
+			var failed = pending.Where(p => p.Tcs.Task.IsCompleted && !OperationSucceeded(p.Operation)).Select(p => p.Name).ToArray();
+			int loaded = pending.Count - stuck.Length - failed.Length;
 
-			if (stuck.Length > 0 || failed.Length > 0)
+			if (stuck.Length == 0 && failed.Length == 0)
 			{
-				if (logEachFailure)
-				{
-					Logger.LogWarning(
-						$"{label} bundles for profile {profileId}: {pending.Count - stuck.Length - failed.Length}/{pending.Count} loaded. " +
-						$"Never settled: [{string.Join(", ", stuck)}]. Failed: [{string.Join(", ", failed)}]. Proceeding anyway.");
-				}
-				else
-				{
-					Logger.LogWarning($"{label} bundles for profile {profileId}: {pending.Count - stuck.Length - failed.Length}/{pending.Count} loaded ({stuck.Length} never settled, {failed.Length} failed). Proceeding anyway.");
-				}
+				Logger.LogWarning($"{label} for profile {profileId}: all {pending.Count} loaded.");
+				return;
+			}
+
+			if (logEachFailure)
+			{
+				Logger.LogWarning(
+					$"{label} for profile {profileId}: {loaded}/{pending.Count} loaded. " +
+					$"Never settled: [{string.Join(", ", stuck)}]. Failed: [{string.Join(", ", failed)}]. Proceeding anyway.");
+			}
+			else
+			{
+				Logger.LogWarning($"{label} for profile {profileId}: {loaded}/{pending.Count} loaded ({stuck.Length} never settled, {failed.Length} failed). Proceeding anyway.");
 			}
 		}
 
-		/// <summary>One in-flight single-bundle load started by <see cref="LoadBundlesIndividuallyAsync"/>.</summary>
+		/// <summary>
+		/// Reads an operation's Succeed flag without the call site having to name its exact type.
+		/// LoadAssetAsync returns IOperation&lt;object&gt;, and whether that derives from the
+		/// non-generic IOperation is not confirmed for this obfuscated build, so fall back to
+		/// reflection rather than betting the whole build on it.
+		/// </summary>
+		private static bool OperationSucceeded(object operation)
+		{
+			if (operation == null)
+			{
+				return false;
+			}
+
+			if (operation is IOperation plain)
+			{
+				return plain.Succeed;
+			}
+
+			try
+			{
+				var property = operation.GetType().GetProperty("Succeed");
+				return property?.GetValue(operation) is bool succeeded && succeeded;
+			}
+			catch
+			{
+				return false;
+			}
+		}
+
+		/// <summary>One in-flight resource load started by <see cref="LoadResourceKeysAsync"/>.</summary>
 		private sealed class PendingBundleLoad
 		{
 			public string Name;
-			public IOperation Operation;
+
+			/// <summary>
+			/// The IOperation. Typed as object because LoadAssetAsync returns IOperation&lt;object&gt;
+			/// and this build's generic/non-generic relationship isn't confirmed - read its result
+			/// through <see cref="OperationSucceeded"/>.
+			/// </summary>
+			public object Operation;
+
 			public TaskCompletionSource<bool> Tcs;
 		}
 
-		private static IEnumerator DriveOperationCoroutine(IOperation operation, TaskCompletionSource<bool> tcs)
+		// Unity's coroutine runner nests any IEnumerator that gets yielded to it, so an operation
+		// passed as object still drives correctly - and taking object here keeps this usable for
+		// both the generic and non-generic IOperation.
+		private static IEnumerator DriveOperationCoroutine(object operation, TaskCompletionSource<bool> tcs)
 		{
 			yield return operation;
-			tcs.TrySetResult(operation.Succeed);
+			tcs.TrySetResult(OperationSucceeded(operation));
 		}
 
 		/// <summary>
