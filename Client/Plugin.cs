@@ -149,6 +149,7 @@ namespace SevenBoldPencil.TargetDummies
 
     		if (!TarkovApplication.Exist(out var tarkovApplication))
             {
+                Logger.LogWarning("SpawnBot aborted: TarkovApplication.Exist() returned false.");
                 return;
             }
 
