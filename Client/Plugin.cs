@@ -426,10 +426,6 @@ namespace SevenBoldPencil.TargetDummies
 
 			ApplyPose(botPlayer, data.Pose.Value);
 
-			// Must happen now, not before the spawn: HollywoodFX registers the players that exist at
-			// the moment it is wired, so a mannequin created afterwards gets no hit effects at all.
-			Patch_HollywoodFX_ForceEffectsInHideout.RewireForNewPlayers();
-
 			DebugLog($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position} ({data.Pose.Value}).");
 
 			}

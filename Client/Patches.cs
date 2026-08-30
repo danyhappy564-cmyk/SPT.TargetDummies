@@ -230,25 +230,14 @@ namespace SevenBoldPencil.TargetDummies
 
 		private static bool _shotDelegateWireAttempted;
 
-		/// <summary>
-		/// Re-runs the wiring so HollywoodFX picks up mannequins that did not exist last time.
-		/// </summary>
-		/// <remarks>
-		/// PORTING NOTE (SPT 4.0.13): HollywoodFX's GameWorldStartedPostfixPatch registers the
-		/// players present at the moment it runs. Anything spawned afterwards is not in its registry
-		/// and gets no hit effects at all - it just stands there rigid and never bleeds. So this has
-		/// to be called AFTER a mannequin is in the world, which is also why an earlier attempt at
-		/// this failed: it re-wired before respawning, when the old mannequins were already gone and
-		/// the new ones did not exist yet, so nothing at all got registered.
-		///
-		/// Only the player-registration half actually repeats. The shot-delegate wrapper is global
-		/// and detects that it is already wired, so re-running is cheap and safe.
-		/// </remarks>
-		internal static void RewireForNewPlayers()
-		{
-			_shotDelegateWireAttempted = false;
-			TryWireShotDelegateOnce();
-		}
+		// PORTING NOTE (SPT 4.0.13): do NOT re-run the wiring per spawn. That was tried to make
+		// respawned mannequins bleed, and it is actively harmful: HollywoodFX re-instantiates its
+		// gore effect prefabs every time it is wired. One session logged 2,642 "Registering material
+		// Puff", 155 gore collision handlers and 90 explosion prefabs, which brought back the spawn
+		// stutter, made corpses fly across the room from the duplicated handlers stacking forces,
+		// and made mannequins look briefly invulnerable. It does not even register bots - each
+		// re-run found only the local player. Whatever registers a bot with HollywoodFX is somewhere
+		// else and still needs to be found.
 
 		/// <summary>
 		/// HollywoodFX's <c>PlayerDamageRegistry</c>/<c>ImpactStatic.LocalPlayer</c> only get wired

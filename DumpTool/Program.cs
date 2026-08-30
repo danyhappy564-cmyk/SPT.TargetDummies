@@ -38,8 +38,17 @@ class Program
             return File.Exists(path) ? Assembly.LoadFrom(path) : null;
         };
 
+        // Round 9 also needs HollywoodFX itself, which lives under BepInEx/plugins, not Managed.
+        var searchDirs = new List<string> { managedDir };
+        string pluginsDir = Path.Combine(sptRoot, "BepInEx", "plugins");
+        if (Directory.Exists(pluginsDir))
+        {
+            searchDirs.AddRange(Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories));
+            searchDirs.Add(pluginsDir);
+        }
+
         var allTypes = new List<Type>();
-        foreach (string dllPath in Directory.GetFiles(managedDir, "*.dll"))
+        foreach (string dllPath in searchDirs.SelectMany(d => Directory.GetFiles(d, "*.dll")))
         {
             string fileName = Path.GetFileNameWithoutExtension(dllPath);
             if (fileName.StartsWith("UnityEngine.", StringComparison.OrdinalIgnoreCase)
@@ -155,50 +164,46 @@ class Program
             w.Flush();
         }
 
-        // 1. The load path the working SPT 4.1 version of this mod actually used.
-        DumpMethodIL("PoolManagerClass", "LoadBundlesAndCreatePools");
-        DumpMethodIL("PoolManagerClass", "method_1");
-        DumpMethodIL("PoolManagerClass", "RegisterPools");
-
-        // 2. The path this backport currently uses, which never completes - for comparison.
-        DumpMethodIL("AssetsManagerClass", "LoadBundlesAsync");
-
-        // 3. A simpler single-bundle API whose signature has no unloadable types in it.
-        DumpAllMembers("BundlesManagerClass");
-        DumpAllMembers("AssetsManagerClass");
-
-        // 4. Every loader-shaped method anywhere that takes ResourceKeys directly, so the string
-        //    conversion (and its per-key-type inconsistency) can be skipped entirely.
-        w.WriteLine();
-        w.WriteLine("=== Methods anywhere taking ResourceKey(s), named like a loader ===");
-        foreach (var t in allTypes)
+        // Round 9: respawned/refreshed mannequins never bleed. Re-running HollywoodFX's
+        // GameWorldStartedPostfixPatch does not register them (each run finds only the local
+        // player) and re-instantiates its gore prefabs, which caused spawn stutter, corpses flying
+        // across the room and apparent invulnerability. So find what actually puts a player into
+        // HollywoodFX's damage registry, and whether a bot can be added to it directly.
+        foreach (var t in allTypes.Where(x => x.FullName != null && x.FullName.StartsWith("HollywoodFX", StringComparison.Ordinal)))
         {
-            foreach (var m in SafeGet(() => t.GetMethods(flags).Where(x => !x.IsSpecialName).ToArray()))
+            w.WriteLine();
+            w.WriteLine("=== " + t.FullName + " ===");
+
+            foreach (var f in SafeGet(() => t.GetFields(flags)))
             {
-                if (m.Name.IndexOf("Load", StringComparison.OrdinalIgnoreCase) < 0
-                    && m.Name.IndexOf("Bundle", StringComparison.OrdinalIgnoreCase) < 0
-                    && m.Name.IndexOf("Pool", StringComparison.OrdinalIgnoreCase) < 0)
-                {
-                    continue;
-                }
-
-                ParameterInfo[] ps;
-                try { ps = m.GetParameters(); }
-                catch { continue; }
-
-                bool takesResourceKey = ps.Any(p =>
-                {
-                    try { return p.ParameterType.ToString().Contains("ResourceKey"); }
-                    catch { return false; }
-                });
-
-                if (takesResourceKey)
-                {
-                    w.WriteLine("  " + t.FullName + " :: " + FormatMethod(m));
-                }
+                string ft;
+                try { ft = f.FieldType.ToString(); } catch (Exception ex) { ft = "<?:" + ex.GetType().Name + ">"; }
+                w.WriteLine("  field: " + ft + " " + f.Name + (f.IsStatic ? " [static]" : "") + (f.IsPublic ? " [public]" : ""));
             }
+
+            foreach (var m in SafeGet(() => t.GetMethods(flags)))
+            {
+                w.WriteLine("  method: " + FormatMethod(m) + (m.IsStatic ? " [static]" : "") + (m.IsPublic ? " [public]" : ""));
+            }
+            w.Flush();
         }
-        w.Flush();
+
+        // The registry is the thing to populate - dump the IL of anything that writes to it.
+        foreach (var name in new[] { "PlayerDamageRegistry", "ImpactStatic", "GameWorldStartedPostfixPatch", "ShotDelegateWrapperPatch", "MaterialRegistry" })
+        {
+            Type t = Find(name);
+            if (t == null) continue;
+
+            foreach (var m in SafeGet(() => t.GetMethods(flags)))
+            {
+                w.WriteLine();
+                w.WriteLine("=== IL: " + t.FullName + "." + m.Name + " ===");
+                w.WriteLine("  signature: " + FormatMethod(m));
+                try { DecompileWorker.PrintRawIL(w, m); }
+                catch (Exception ex) { w.WriteLine("  <PrintRawIL failed: " + ex.Message + ">"); }
+            }
+            w.Flush();
+        }
 
         Console.WriteLine("Wrote dump.txt");
     }
