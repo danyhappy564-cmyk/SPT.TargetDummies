@@ -342,23 +342,37 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			string SafeToAssetName(ResourceKey key)
+			// PORTING NOTE (SPT 4.0.13): confirmed via DumpTool - IAssetsManager.LoadBundlesAsync
+			// only ever accepted string[], on both 4.1 and here; there's no ResourceKey[]-accepting
+			// overload anywhere to sidestep the string conversion with. ToAssetName() itself is
+			// inconsistent per resource key type - confirmed via the game's own errors.log it
+			// already returns a well-formed, ".bundle"-suffixed, forward-slash path for character
+			// head/body keys, but a backslash-mixed path with NO ".bundle" suffix for clothing/
+			// weapon-mod keys (both get sent as literal HTTP request paths, so the malformed ones
+			// 404 outright). Normalizing every result the same way - forward slashes, ensure a
+			// ".bundle" suffix - fixes both shapes without needing to special-case by key type.
+			string NormalizeBundleName(ResourceKey key)
 			{
-				try { return key.ToAssetName(); }
+				string name;
+				try { name = key.ToAssetName(); }
 				catch { return null; }
+
+				if (string.IsNullOrEmpty(name))
+				{
+					return null;
+				}
+
+				name = name.Replace('\\', '/');
+				if (!name.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase))
+				{
+					name += ".bundle";
+				}
+
+				return name;
 			}
 
-			// PORTING NOTE (SPT 4.0.13): confirmed via the game's own errors.log - unioning
-			// ToAssetName()/rcid/path together (a previous attempt at this method) was actively
-			// harmful. ToAssetName() produces the correct, well-formed name the server actually
-			// serves (matches the exact "<name>.bundle is not loaded" text LocalPlayer.Create
-			// throws when a bundle genuinely isn't ready yet). rcid and path instead produce a
-			// backslash-mixed, non-".bundle"-suffixed string for these character/gear keys, and
-			// EVERY SINGLE bundle in the batch got an HTTP 404 once those malformed names were
-			// mixed into the same LoadBundlesAsync call - not just the one asset they were meant
-			// for. ToAssetName() alone is both correct and sufficient.
 			var bundleNames = resourceKeys
-				.Select(SafeToAssetName)
+				.Select(NormalizeBundleName)
 				.Where(name => !string.IsNullOrEmpty(name))
 				.Distinct()
 				.ToArray();
