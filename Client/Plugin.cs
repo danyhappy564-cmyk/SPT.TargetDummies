@@ -487,7 +487,14 @@ namespace SevenBoldPencil.TargetDummies
 				}
 
 				string profileId = bot.ProfileId;
-				Vector3 position = bot.Transform != null ? bot.Transform.position : bot.transform.position;
+				// Player.transform is obsolete-as-an-error on this build; Player.Transform is the
+				// supported accessor, so there is no fallback to fall back to.
+				if (bot.Transform == null)
+				{
+					return;
+				}
+
+				Vector3 position = bot.Transform.position;
 
 				foreach (var corpse in gameWorld.LootList.OfType<Corpse>().ToArray())
 				{
