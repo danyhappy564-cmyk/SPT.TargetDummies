@@ -318,62 +318,54 @@ namespace SevenBoldPencil.TargetDummies
 				catch { return null; }
 			}
 
-			(string Label, Func<ResourceKey, string> Selector)[] candidates =
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - trying candidates one at a time and
+			// stopping at the first whose LoadBundlesAsync call reports overall Succeed==true is
+			// NOT enough. That call still reported success while at least one specific bundle
+			// (a randomized "wild_head_N.bundle" scav head variant) silently never resolved,
+			// because a batch load can succeed overall even if individual malformed names in it are
+			// just skipped rather than causing a failure. LocalPlayer.Create then threw "wild_head_N
+			// is not loaded" mid-construction, leaving a bodyless bot with only gear attached.
+			// Loading the UNION of every candidate's converted names in one call - rather than
+			// racing candidates and stopping at the first that "works" - means whichever format a
+			// given resource key actually needs still gets tried.
+			var bundleNames = resourceKeys
+				.SelectMany(key => new[] { SafeToAssetName(key), key.rcid, key.path })
+				.Where(name => !string.IsNullOrEmpty(name))
+				.Distinct()
+				.ToArray();
+
+			if (bundleNames.Length == 0)
 			{
-				("ToAssetName()", SafeToAssetName),
-				("rcid", key => key.rcid),
-				("path", key => key.path),
-			};
+				Logger.LogWarning($"No usable bundle names were produced for mannequin profile {profile.Id}; proceeding anyway.");
+				return;
+			}
 
-			const double candidateTimeoutSeconds = 20;
+			var operation = assetsManager.LoadBundlesAsync(bundleNames);
 
-			foreach (var candidate in candidates)
+			var tcs = new TaskCompletionSource<bool>();
+			StartCoroutine(DriveOperationCoroutine(operation, tcs));
+
+			const double timeoutSeconds = 20;
+			var waitStart = DateTime.UtcNow;
+			while (true)
 			{
-				var bundleNames = resourceKeys
-					.Select(candidate.Selector)
-					.Where(name => !string.IsNullOrEmpty(name))
-					.Distinct()
-					.ToArray();
-
-				if (bundleNames.Length == 0)
+				var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(2)));
+				if (completed == tcs.Task)
 				{
-					continue;
+					break;
 				}
 
-				var operation = assetsManager.LoadBundlesAsync(bundleNames);
-
-				var tcs = new TaskCompletionSource<bool>();
-				StartCoroutine(DriveOperationCoroutine(operation, tcs));
-
-				var waitStart = DateTime.UtcNow;
-				var timedOut = false;
-				while (true)
+				if ((DateTime.UtcNow - waitStart).TotalSeconds >= timeoutSeconds)
 				{
-					var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(2)));
-					if (completed == tcs.Task)
-					{
-						break;
-					}
-
-					if ((DateTime.UtcNow - waitStart).TotalSeconds >= candidateTimeoutSeconds)
-					{
-						timedOut = true;
-						break;
-					}
-				}
-
-				if (timedOut)
-				{
-					continue;
-				}
-
-				if (operation.Succeed)
-				{
+					Logger.LogWarning($"Bundle preload timed out for mannequin profile {profile.Id}; proceeding anyway.");
 					return;
 				}
 			}
 
-			Logger.LogWarning($"Every bundle key candidate failed or timed out for mannequin profile {profile.Id}; proceeding anyway.");
+			if (!operation.Succeed)
+			{
+				Logger.LogWarning($"Bundle preload did not succeed for mannequin profile {profile.Id} (Failed={operation.Failed} Error={operation.Error}); proceeding anyway.");
+			}
 		}
 
 		private static IEnumerator DriveOperationCoroutine(IOperation operation, TaskCompletionSource<bool> tcs)
