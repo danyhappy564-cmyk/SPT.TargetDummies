@@ -10,8 +10,8 @@
     <Version>$(AssemblyVersion)</Version>
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
-    <!-- Overridable via -p:SPTPath=... ; only applies the relative default when nothing was passed in. -->
-    <SPTPath Condition="'$(SPTPath)' == ''">..\..\..\Escape from Tarkov</SPTPath>
+    <!-- Overridable via -p:SPTPath=... ; only applies this default when nothing was passed in. -->
+    <SPTPath Condition="'$(SPTPath)' == ''">E:\SPT 4.0.10</SPTPath>
     <OutPath>$(SPTPath)\BepInEx\plugins\7Bpencil.TargetDummies</OutPath>
     <StagePath>$(ProjectDir)..\Stage\BepInEx\plugins\7Bpencil.TargetDummies</StagePath>
     <AssemblySearchPaths>
