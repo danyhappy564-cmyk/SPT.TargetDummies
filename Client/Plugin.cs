@@ -509,7 +509,12 @@ namespace SevenBoldPencil.TargetDummies
 			return profile;
 		}
 
-		public ProfileDescriptor GenerateMannequinProfile()
+		// PORTING NOTE (SPT 4.0.13): ProfileDescriptor (4.1's name) is CompleteProfileDescriptorClass
+		// here - confirmed via Profile's own constructor signature. Has many more fields than 4.1's
+		// version (AccountId, Skills, Hideout, Stats, TradersInfo, ...), all left at their C# default
+		// (null) since this mod's original code never set them either - only Id/Info/Customization/
+		// Health/Inventory are populated below.
+		public CompleteProfileDescriptorClass GenerateMannequinProfile()
 		{
 			return new()
 			{
@@ -533,7 +538,13 @@ namespace SevenBoldPencil.TargetDummies
 			};
 		}
 
-		public Profile.HealthInfo GenerateDefaultHealth()
+		// PORTING NOTE (SPT 4.0.13): Profile.HealthInfo (4.1's name) is Profile.ProfileHealthClass
+		// here. Its nested ValueInfo type kept its name; BodyPartInfo is ProfileBodyPartHealthClass.
+		// Both nested types also gained fields this code doesn't set (ValueInfo got
+		// OverDamageReceivedMultiplier/EnvironmentDamageMultiplier, left at 0f; unconfirmed whether
+		// a 0 multiplier has any unwanted effect on the mannequin's damage response - check this if
+		// mannequins seem unkillable or take no damage).
+		public Profile.ProfileHealthClass GenerateDefaultHealth()
 		{
 			return new()
 			{
@@ -554,17 +565,17 @@ namespace SevenBoldPencil.TargetDummies
 			};
 		}
 
-		public static Profile.HealthInfo.BodyPartInfo NewBodyPartInfo(float maxHealthValue)
+		public static Profile.ProfileHealthClass.ProfileBodyPartHealthClass NewBodyPartInfo(float maxHealthValue)
 		{
 			return new() { Health = NewHealthValueInfo(maxHealthValue) };
 		}
 
-		public static Profile.HealthInfo.ValueInfo NewHealthValueInfo(float maxValue)
+		public static Profile.ProfileHealthClass.ValueInfo NewHealthValueInfo(float maxValue)
 		{
 			return NewHealthValueInfo(maxValue, 0, maxValue);
 		}
 
-		public static Profile.HealthInfo.ValueInfo NewHealthValueInfo(float currentValue, float minValue, float maxValue)
+		public static Profile.ProfileHealthClass.ValueInfo NewHealthValueInfo(float currentValue, float minValue, float maxValue)
 		{
 			return new()
 			{
@@ -574,16 +585,32 @@ namespace SevenBoldPencil.TargetDummies
 			};
 		}
 
-		public static InventoryDescriptor GenerateDefaultInventory()
+		// PORTING NOTE (SPT 4.0.13, UNCONFIRMED AT RUNTIME): InventoryDescriptor (4.1's simple
+		// _items[]/_equipmentId shape) doesn't exist here - Profile's Inventory field is
+		// EFTInventoryClass, a much larger class. Best-effort reconstruction from field shape alone
+		// (no source access): Gclass1390_0 (FlatItemsDataClass[]) looks like the renamed flat item
+		// list (FlatItemsDataClass has the same _id/_tpl fields _items' elements had, plus
+		// parentId/slotId left null for a parentless root item), and FastAccess
+		// (Dictionary<EBoundItem, MongoID>) looks like the lookup 4.1's single _equipmentId scalar
+		// was replaced by - EFTInventoryClass.Equipment/.Stash/etc. are each backed by one
+		// EBoundItem entry, and EBoundItem.Equipment is guessed to correspond to the Equipment
+		// property by name. This compiles but is NOT confirmed to actually make
+		// profile.Inventory.Equipment resolve to a working container - if the mannequin's gear
+		// doesn't render or SetSlotItem throws, this is the first place to re-check (dump
+		// EFTInventoryClass.Equipment's getter body, or EBoundItem's real enum member names).
+		public static EFTInventoryClass GenerateDefaultInventory()
 		{
 		    var equipment = MongoID.Generate(true);
 			return new()
 			{
-				_items =
-				[
+				Gclass1390_0 = new FlatItemsDataClass[]
+				{
 					new() { _id = equipment, _tpl = "55d7217a4bdc2d86028b456d" },
-				],
-				_equipmentId = equipment,
+				},
+				FastAccess = new Dictionary<EBoundItem, MongoID>
+				{
+					{ EBoundItem.Equipment, equipment },
+				},
 			};
 		}
 

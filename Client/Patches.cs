@@ -59,15 +59,25 @@ namespace SevenBoldPencil.TargetDummies
 		}
 	}
 
+	// PORTING NOTE (SPT 4.0.13): CorpseRagdoll (4.1's name) doesn't exist here - found via DumpTool
+	// by shape (a class with a Start() method plus a PlayerBody field and a bare System.Action
+	// field, matching _owner/_onRigidbodyStopped's roles) rather than a straight name search.
+	// RagdollClass._owner's replacement is PlayerBody_0 (confirmed EFT.PlayerBody inherits
+	// UnityEngine.Component, so .TryGetComponent<LocalPlayer>() still resolves), and
+	// _onRigidbodyStopped's replacement is Action_0 - the only plain no-arg Action field on the
+	// class (its other delegate fields are Func<bool,float,bool>/Func<bool>, which don't fit a
+	// "stopped" notification). Both are public, so no Harmony ____field injection is needed. This
+	// mapping is inferred from field shape, not confirmed from source - if bot death stops
+	// respawning mannequins, check whether Action_0 fires here at all.
 	public class Patch_CorpseRagdoll_Start : ModulePatch
 	{
         protected override MethodBase GetTargetMethod()
         {
-            return AccessTools.Method(typeof(CorpseRagdoll), nameof(CorpseRagdoll.Start));
+            return AccessTools.Method(typeof(RagdollClass), nameof(RagdollClass.Start));
         }
 
         [PatchPrefix]
-        public static void Prefix(CorpseRagdoll __instance)
+        public static void Prefix(RagdollClass __instance)
 		{
 			var gameWorld = Singleton<GameWorld>.Instance;
 			if (gameWorld is not HideoutGameWorld)
@@ -75,9 +85,9 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			__instance._onRigidbodyStopped += () =>
+			__instance.Action_0 += () =>
 			{
-				if (__instance._owner.TryGetComponent<LocalPlayer>(out var localPlayer))
+				if (__instance.PlayerBody_0.TryGetComponent<LocalPlayer>(out var localPlayer))
 				{
 					Plugin.Instance.OnBotDeath(localPlayer);
 				}
