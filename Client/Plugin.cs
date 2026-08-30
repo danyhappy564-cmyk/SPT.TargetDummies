@@ -462,21 +462,50 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			DestroyCorpseOf(bot);
+			// PORTING NOTE (SPT 4.0.13): order matters here, and getting it wrong is what left
+			// weapons hanging in mid-air. The Corpse owns the dead mannequin's body, so destroying
+			// it first tore that body down and the following Dispose() then threw
+			// NullReferenceException - once per despawn, confirmed in-game - which meant
+			// ReturnToPool never ran and the held weapon was never cleaned up. Identify the corpse
+			// first, dispose the player, and only then destroy the corpse.
+			string profileId = null;
+			Vector3? position = null;
+			try
+			{
+				profileId = bot.ProfileId;
+				if (bot.Transform != null)
+				{
+					position = bot.Transform.position;
+				}
+			}
+			catch (Exception ex)
+			{
+				DebugLog($"Could not read a mannequin's identity before despawning it: {ex.GetType().Name}: {ex.Message}");
+			}
 
 			try
 			{
 				bot.Dispose();
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not dispose a mannequin: {ex.GetType().Name}: {ex.Message}");
+			}
+
+			try
+			{
 				AssetPoolObject.ReturnToPool(bot.gameObject, true);
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning($"Could not despawn a mannequin: {ex.GetType().Name}: {ex.Message}");
+				Logger.LogWarning($"Could not return a mannequin to the pool: {ex.GetType().Name}: {ex.Message}");
 			}
+
+			DestroyCorpse(profileId, position);
 		}
 
 		/// <summary>Destroys the corpse loot item a dead mannequin left in the world, if any.</summary>
-		private void DestroyCorpseOf(LocalPlayer bot)
+		private void DestroyCorpse(string profileId, Vector3? position)
 		{
 			try
 			{
@@ -485,16 +514,6 @@ namespace SevenBoldPencil.TargetDummies
 				{
 					return;
 				}
-
-				string profileId = bot.ProfileId;
-				// Player.transform is obsolete-as-an-error on this build; Player.Transform is the
-				// supported accessor, so there is no fallback to fall back to.
-				if (bot.Transform == null)
-				{
-					return;
-				}
-
-				Vector3 position = bot.Transform.position;
 
 				foreach (var corpse in gameWorld.LootList.OfType<Corpse>().ToArray())
 				{
@@ -517,7 +536,7 @@ namespace SevenBoldPencil.TargetDummies
 		/// Matches a corpse to the mannequin that produced it - by profile id where the corpse
 		/// exposes one, otherwise by position, since mannequins occupy fixed, well separated slots.
 		/// </summary>
-		private static bool CorpseBelongsTo(Corpse corpse, string profileId, Vector3 position)
+		private static bool CorpseBelongsTo(Corpse corpse, string profileId, Vector3? position)
 		{
 			if (corpse == null)
 			{
@@ -558,10 +577,15 @@ namespace SevenBoldPencil.TargetDummies
 
 			// Fallback: the corpse dropped where the mannequin stood. Slots are metres apart, so a
 			// tight radius cannot pick up a neighbouring mannequin's body.
+			if (position == null)
+			{
+				return false;
+			}
+
 			try
 			{
 				return corpse.transform != null
-					&& (corpse.transform.position - position).sqrMagnitude <= 4f;
+					&& (corpse.transform.position - position.Value).sqrMagnitude <= 4f;
 			}
 			catch
 			{
