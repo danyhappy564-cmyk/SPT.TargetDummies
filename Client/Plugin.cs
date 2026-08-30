@@ -113,6 +113,8 @@ namespace SevenBoldPencil.TargetDummies
 		public ConfigEntry<float> SpawnInterval;
 		public ConfigEntry<string> FallbackMeleeTemplateId;
 
+		public ConfigEntry<KeyboardShortcut> RefreshHotkey;
+
 		public ConfigEntry<MannequinPose> CloseRowPose;
 		public ConfigEntry<MannequinPose> FarRowPose;
 
@@ -128,6 +130,23 @@ namespace SevenBoldPencil.TargetDummies
         {
             Instance = this;
 			LoggerInstance = Logger;
+
+			// A button rather than a value: pressing it rebuilds every mannequin from your current
+			// gear, so you do not have to run a raid or restart the game to see a loadout change.
+			Config.Bind<string>("Mannequin Settings", "Refresh Mannequins", "", new ConfigDescription(
+				"Respawn all mannequins now, using the gear you are currently wearing.",
+				null,
+				new ConfigurationManagerAttributes
+				{
+					Order = 10,
+					HideDefaultButton = true,
+					HideSettingName = true,
+					CustomDrawer = _ => DrawRefreshButton(),
+				}));
+
+			RefreshHotkey = Config.Bind<KeyboardShortcut>("Mannequin Settings", "Refresh Hotkey", new KeyboardShortcut(KeyCode.F6), new ConfigDescription(
+				"Key that respawns all mannequins with your current gear, without opening this menu.",
+				null, new ConfigurationManagerAttributes { Order = 9 }));
 
 			SpawnUnarmored = Config.Bind<bool>("Mannequin Settings", "Spawn Unarmored", false, new ConfigDescription(
 				"Spawn mannequins with no gear at all, keeping only the melee weapon from your Scabbard slot. "
@@ -1253,6 +1272,85 @@ namespace SevenBoldPencil.TargetDummies
 					yield return null;
 				}
 			}
+		}
+
+		private void Update()
+		{
+			if (RefreshHotkey != null && RefreshHotkey.Value.IsDown())
+			{
+				RefreshMannequins();
+			}
+		}
+
+		/// <summary>Draws the "Refresh Mannequins" button in the F12 config menu.</summary>
+		private void DrawRefreshButton()
+		{
+			bool available = Mannequins != null && Singleton<GameWorld>.Instance is HideoutGameWorld;
+
+			GUI.enabled = available;
+			if (GUILayout.Button(available ? "Refresh Mannequins" : "Refresh Mannequins (enter the shooting range first)", GUILayout.ExpandWidth(true)))
+			{
+				RefreshMannequins();
+			}
+			GUI.enabled = true;
+		}
+
+		/// <summary>
+		/// Rebuilds every mannequin from the player's current gear, without needing a raid or a
+		/// restart.
+		/// </summary>
+		public void RefreshMannequins()
+		{
+			if (Singleton<GameWorld>.Instance is not HideoutGameWorld)
+			{
+				Logger.LogWarning("Refresh ignored: you are not in the hideout shooting range.");
+				return;
+			}
+
+			if (_refreshing)
+			{
+				DebugLog("Refresh ignored: one is already running.");
+				return;
+			}
+
+			StartCoroutine(RefreshMannequinsRoutine());
+		}
+
+		private bool _refreshing;
+
+		private IEnumerator RefreshMannequinsRoutine()
+		{
+			_refreshing = true;
+
+			// Snapshot first: despawning mutates Mannequins, and each slot has to be respawned from
+			// the same MannequinData it was using (its position and its row's pose).
+			var existing = Mannequins.ToArray();
+			foreach (var pair in existing)
+			{
+				Mannequins.Remove(pair.Key);
+
+				try
+				{
+					pair.Key.Dispose();
+					AssetPoolObject.ReturnToPool(pair.Key.gameObject, true);
+				}
+				catch (Exception ex)
+				{
+					Logger.LogWarning($"Could not despawn a mannequin during refresh: {ex.GetType().Name}: {ex.Message}");
+				}
+
+				yield return null;
+			}
+
+			yield return new WaitForSeconds(SpawnInterval.Value);
+
+			foreach (var pair in existing)
+			{
+				yield return WaitForTaskOrTimeout(SpawnBot(pair.Value), 120f);
+				yield return new WaitForSeconds(SpawnInterval.Value);
+			}
+
+			_refreshing = false;
 		}
 
 		public IEnumerator SpawnInitialBots()
