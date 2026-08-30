@@ -231,6 +231,16 @@ namespace SevenBoldPencil.TargetDummies
 		private static bool _shotDelegateWireAttempted;
 
 		/// <summary>
+		/// Allows the wiring below to run again. Needed after a refresh replaces every mannequin:
+		/// HollywoodFX registers the players it knows about when it is wired, so bots created
+		/// afterwards get no hit effects and just stand there rigid until it is redone.
+		/// </summary>
+		internal static void ResetShotDelegateWiring()
+		{
+			_shotDelegateWireAttempted = false;
+		}
+
+		/// <summary>
 		/// HollywoodFX's <c>PlayerDamageRegistry</c>/<c>ImpactStatic.LocalPlayer</c> only get wired
 		/// up from a <c>Postfix</c> on <c>GameWorld.OnGameStarted()</c>, which the Hideout never
 		/// calls (unlike <c>GameWorld.Awake()</c>, which the effects-init fix above relies on).

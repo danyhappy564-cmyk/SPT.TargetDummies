@@ -401,13 +401,19 @@ namespace SevenBoldPencil.TargetDummies
 			// remarks on UsePlayerCharacterModel). An armed mannequin is cosmetic; a mannequin that
 			// exists, takes hits and dies is the point. So a failure here is logged and swallowed
 			// rather than aborting a bot that is otherwise fine.
+			// PORTING NOTE (SPT 4.0.13): pick a slot that actually holds something. This was hardcoded
+			// to FirstPrimaryWeapon, so in unarmored mode - where the only item is the melee weapon -
+			// it put nothing in the mannequin's hands at all: the knife sat on its belt and the
+			// mannequin stood there empty-handed.
+			var handsSlot = FindSlotToHold(botPlayer);
+
 			try
 			{
-				botPlayer.SetSlotItem(EquipmentSlot.FirstPrimaryWeapon, (_) => { });
+				botPlayer.SetSlotItem(handsSlot, (_) => { });
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning($"Could not put a weapon in mannequin {botPlayerProfile.Id}'s hands ({ex.GetType().Name}: {ex.Message}); giving it empty hands instead.");
+				Logger.LogWarning($"Could not put the {handsSlot} item in mannequin {botPlayerProfile.Id}'s hands ({ex.GetType().Name}: {ex.Message}); giving it empty hands instead.");
 
 				// PORTING NOTE (SPT 4.0.13): a bot left with NO hands controller at all
 				// NullReferences every single frame in MovementContext -> Player.MouseLook ->
@@ -792,6 +798,42 @@ namespace SevenBoldPencil.TargetDummies
 			return profile;
 		}
 
+		/// <summary>
+		/// Picks the equipment slot whose item the mannequin should hold: a primary weapon if it has
+		/// one, otherwise a sidearm, otherwise its melee weapon.
+		/// </summary>
+		private EquipmentSlot FindSlotToHold(LocalPlayer botPlayer)
+		{
+			var preference = new[]
+			{
+				EquipmentSlot.FirstPrimaryWeapon,
+				EquipmentSlot.SecondPrimaryWeapon,
+				EquipmentSlot.Holster,
+				EquipmentSlot.Scabbard,
+			};
+
+			try
+			{
+				var equipment = botPlayer.Profile?.Inventory?.Equipment;
+				if (equipment != null)
+				{
+					foreach (var slot in preference)
+					{
+						if (equipment.GetSlot(slot)?.ContainedItem != null)
+						{
+							return slot;
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				DebugLog($"Could not inspect the mannequin's equipment slots: {ex.GetType().Name}: {ex.Message}");
+			}
+
+			return EquipmentSlot.FirstPrimaryWeapon;
+		}
+
 		/// <summary>The player's own melee weapon, or null if they are not carrying one.</summary>
 		private static Item FindScabbardItem(Profile playerProfile)
 		{
@@ -830,9 +872,12 @@ namespace SevenBoldPencil.TargetDummies
 		/// built from a weapon you happen to be carrying does not shine it back down the range.
 		/// </summary>
 		/// <remarks>
-		/// Reflection-based on purpose: LightComponent and its active flag are resolved by name, so
-		/// this degrades to a logged no-op on a build where they differ rather than failing to
-		/// compile or throwing into the spawn path.
+		/// PORTING NOTE (SPT 4.0.13): resolved entirely by name, because the first attempt guessed
+		/// wrong - it looked for Item.GetItemComponentsInChildren, which this build does not have
+		/// ("Item.GetItemComponentsInChildren was not found" on every spawn). Rather than guess
+		/// again, walk the item's own slot tree by hand and probe each item's components through
+		/// whichever accessor exists. When nothing matches, the available member names are logged
+		/// once so the correct one can be read straight out of the log.
 		/// </remarks>
 		private void TurnOffLights(Item item)
 		{
@@ -843,52 +888,167 @@ namespace SevenBoldPencil.TargetDummies
 
 			try
 			{
-				var lightComponentType = typeof(Item).Assembly.GetType("EFT.InventoryLogic.LightComponent");
-				if (lightComponentType == null)
+				foreach (var current in EnumerateItemTree(item))
 				{
-					return;
-				}
-
-				var getComponents = typeof(Item)
-					.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-					.FirstOrDefault(m => m.Name == "GetItemComponentsInChildren"
-						&& m.IsGenericMethodDefinition
-						&& m.GetParameters().Length <= 1);
-
-				if (getComponents == null)
-				{
-					DebugLog("Item.GetItemComponentsInChildren was not found; weapon lights cannot be switched off.");
-					return;
-				}
-
-				var closed = getComponents.MakeGenericMethod(lightComponentType);
-				var args = closed.GetParameters().Length == 1 ? new object[] { true } : Array.Empty<object>();
-
-				if (closed.Invoke(item, args) is not IEnumerable components)
-				{
-					return;
-				}
-
-				foreach (var component in components)
-				{
-					if (component == null)
-					{
-						continue;
-					}
-
-					// The flag is IsActive on current builds; SetLightState/IsOn have been used too.
-					var flag = component.GetType().GetProperty("IsActive", BindingFlags.Public | BindingFlags.Instance)
-						?? component.GetType().GetProperty("IsOn", BindingFlags.Public | BindingFlags.Instance);
-
-					if (flag != null && flag.CanWrite && flag.PropertyType == typeof(bool))
-					{
-						flag.SetValue(component, false);
-					}
+					TurnOffLightsOnSingleItem(current);
 				}
 			}
 			catch (Exception ex)
 			{
 				DebugLog($"Could not switch off weapon lights: {ex.GetType().Name}: {ex.Message}");
+			}
+		}
+
+		/// <summary>Walks an item and everything attached into its slots, depth first.</summary>
+		private static IEnumerable<Item> EnumerateItemTree(Item root)
+		{
+			var pending = new Stack<Item>();
+			pending.Push(root);
+
+			while (pending.Count > 0)
+			{
+				var current = pending.Pop();
+				if (current == null)
+				{
+					continue;
+				}
+
+				yield return current;
+
+				Slot[] slots = null;
+				try { slots = (current as CompoundItem)?.Slots; }
+				catch { }
+
+				if (slots == null)
+				{
+					continue;
+				}
+
+				foreach (var slot in slots)
+				{
+					Item contained = null;
+					try { contained = slot?.ContainedItem; }
+					catch { }
+
+					if (contained != null)
+					{
+						pending.Push(contained);
+					}
+				}
+			}
+		}
+
+		private static bool _loggedMissingLightApi;
+
+		/// <summary>Turns off any light-like component on one item, ignoring its attachments.</summary>
+		private void TurnOffLightsOnSingleItem(Item item)
+		{
+			bool foundAny = false;
+
+			foreach (var component in EnumerateComponents(item))
+			{
+				var type = component.GetType();
+				if (type.Name.IndexOf("Light", StringComparison.OrdinalIgnoreCase) < 0)
+				{
+					continue;
+				}
+
+				foundAny = true;
+
+				// The flag has been IsActive / IsOn / Light on different builds; take whichever
+				// writable bool exists.
+				foreach (var name in new[] { "IsActive", "IsOn", "Light" })
+				{
+					var flag = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+					if (flag != null && flag.CanWrite && flag.PropertyType == typeof(bool))
+					{
+						flag.SetValue(component, false);
+						break;
+					}
+
+					var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance);
+					if (field != null && field.FieldType == typeof(bool))
+					{
+						field.SetValue(component, false);
+						break;
+					}
+				}
+			}
+
+			if (!foundAny && !_loggedMissingLightApi)
+			{
+				_loggedMissingLightApi = true;
+				var members = string.Join(", ", item.GetType()
+					.GetMembers(BindingFlags.Public | BindingFlags.Instance)
+					.Select(m => m.Name)
+					.Where(n => n.IndexOf("Component", StringComparison.OrdinalIgnoreCase) >= 0)
+					.Distinct());
+
+				Logger.LogWarning($"No light component found on '{item.GetType().Name}'. Component-related members are: [{members}]. Weapon lights cannot be switched off until one of these is used.");
+			}
+		}
+
+		/// <summary>
+		/// Yields an item's components, trying each accessor this build might expose.
+		/// </summary>
+		private static IEnumerable<object> EnumerateComponents(Item item)
+		{
+			var type = item.GetType();
+
+			// A plain property/field holding the component collection is the common shape.
+			foreach (var name in new[] { "Components", "AllComponents", "ItemComponents" })
+			{
+				object value = null;
+				try
+				{
+					value = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(item)
+						?? type.GetField(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(item);
+				}
+				catch { }
+
+				if (value is IEnumerable enumerable and not string)
+				{
+					foreach (var component in enumerable)
+					{
+						if (component != null)
+						{
+							yield return component;
+						}
+					}
+
+					yield break;
+				}
+			}
+
+			// Otherwise a parameterless method returning them.
+			MethodInfo method = null;
+			try
+			{
+				method = type.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+					.FirstOrDefault(m => !m.IsGenericMethodDefinition
+						&& m.GetParameters().Length == 0
+						&& (m.Name == "GetAllItemComponents" || m.Name == "GetItemComponents"));
+			}
+			catch { }
+
+			if (method == null)
+			{
+				yield break;
+			}
+
+			object result = null;
+			try { result = method.Invoke(item, Array.Empty<object>()); }
+			catch { }
+
+			if (result is IEnumerable results and not string)
+			{
+				foreach (var component in results)
+				{
+					if (component != null)
+					{
+						yield return component;
+					}
+				}
 			}
 		}
 
@@ -1343,6 +1503,10 @@ namespace SevenBoldPencil.TargetDummies
 			}
 
 			yield return new WaitForSeconds(SpawnInterval.Value);
+
+			// HollywoodFX registers the players it knows about at wiring time, so mannequins created
+			// after that get no hit effects - they just stand there rigid. Re-wire before respawning.
+			Patch_HollywoodFX_ForceEffectsInHideout.ResetShotDelegateWiring();
 
 			foreach (var pair in existing)
 			{
