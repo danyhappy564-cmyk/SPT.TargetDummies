@@ -230,54 +230,42 @@ namespace SevenBoldPencil.TargetDummies
 			//   mapping table - GClass1855 is the sibling PlayerCustomizationFilter, not this one).
 			// Passed positionally rather than by name since the obfuscated build's real parameter
 			// names aren't confirmed to match 4.1's.
-			// PORTING NOTE (SPT 4.0.13): confirmed in-game - even with the bundle preload above
-			// waiting up to a minute and running one mannequin at a time (no more contention),
-			// LocalPlayer.Create still occasionally throws "<bundle> is not loaded" for a
-			// randomized character-mesh bundle (e.g. a scav's "wild_head_N"/"wild_head_misha", or a
-			// "bear_head_N" variant) that GetAllPrefabPaths apparently doesn't always resolve to a
-			// name IAssetsManager.LoadBundlesAsync can find in time - matching spt-hideout-shootout's
-			// own finding that the base character rig arrives via a separate mechanism in a real
-			// raid (InGameBundles.BUNDLES_TO_PRELOAD during GameWorld.InitLevel) that never runs in
-			// the hideout. Retrying after a short delay lets whatever background load is still in
-			// flight catch up, without needing to know the exact bundle-loading gap.
-			LocalPlayer botPlayer = null;
-			const int maxAttempts = 4;
-			for (int attempt = 1; attempt <= maxAttempts; attempt++)
+			// PORTING NOTE (SPT 4.0.13): confirmed via the game's own errors.log - the "<bundle> is
+			// not loaded" exceptions seen here for randomized character-mesh bundles
+			// (e.g. "bear_head_slava", "wild_head_misha") are NOT a preload timing issue at all:
+			// the bundle request itself gets an HTTP 404 from the SPT server ("Can't load bundle:
+			// ...bear_head_slava HTTP/1.1 404 Not Found"). Some other installed mod registers extra
+			// bot head/appearance templates into the bot generation pool without actually shipping
+			// the bundle file for them, so any bot randomly assigned one of those templates can
+			// never spawn - no amount of waiting or retrying fixes a 404. Retrying was tried and
+			// removed: it doesn't help (the file still isn't there) and reusing the same profile/id
+			// across attempts risked LocalPlayer.Create hanging instead of throwing again. A failure
+			// here is caught by SpawnBot's own try/catch below and just skips this one mannequin.
+			LocalPlayer botPlayer;
+			using (SuppressDisableDevMaskCheckPatch())
 			{
-				try
-				{
-					using (SuppressDisableDevMaskCheckPatch())
-					{
-						botPlayer = await LocalPlayer.Create(
-							hideoutGameWorld,
-							botPlayerId,
-							data.Position,
-							rotation,
-							"Player",
-							"",
-							EPointOfView.ThirdPerson,
-							botPlayerProfile,
-							true,
-							hideoutGame.UpdateQueue,
-							Player.EUpdateMode.Auto,
-							Player.EUpdateMode.Auto,
-							botControllerMode,
-							new Func<float>(() => 1f),
-							new Func<float>(() => 1f),
-							new GClass2265(),
-							GClass1856.Default,
-							null,
-							ELocalMode.TRAINING,
-							false,
-							true);
-					}
-					break;
-				}
-				catch (Exception ex) when (attempt < maxAttempts && ex.Message.IndexOf("is not loaded", StringComparison.OrdinalIgnoreCase) >= 0)
-				{
-					Logger.LogWarning($"LocalPlayer.Create attempt {attempt}/{maxAttempts} for mannequin profile {botPlayerProfile.Id} failed ({ex.Message}); retrying in 5s.");
-					await Task.Delay(5000);
-				}
+				botPlayer = await LocalPlayer.Create(
+					hideoutGameWorld,
+					botPlayerId,
+					data.Position,
+					rotation,
+					"Player",
+					"",
+					EPointOfView.ThirdPerson,
+					botPlayerProfile,
+					true,
+					hideoutGame.UpdateQueue,
+					Player.EUpdateMode.Auto,
+					Player.EUpdateMode.Auto,
+					botControllerMode,
+					new Func<float>(() => 1f),
+					new Func<float>(() => 1f),
+					new GClass2265(),
+					GClass1856.Default,
+					null,
+					ELocalMode.TRAINING,
+					false,
+					true);
 			}
 
 			if (botPlayer == null)
