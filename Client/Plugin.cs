@@ -296,6 +296,7 @@ namespace SevenBoldPencil.TargetDummies
 			botPlayer.SetSlotItem(EquipmentSlot.FirstPrimaryWeapon, (_) => {});
 
 			Mannequins[botPlayer] = data;
+			Logger.LogWarning($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position} (type={data.Type.Value}).");
 
 			}
 			catch (Exception e)
