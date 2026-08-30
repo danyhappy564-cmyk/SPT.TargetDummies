@@ -11,18 +11,11 @@
     <LangVersion>latest</LangVersion>
     <SptRoot Condition="'$(SptRoot)' == ''">E:\SPT 4.0.10</SptRoot>
     <AssemblySearchPaths>$(AssemblySearchPaths);$(SptRoot)\EscapeFromTarkov_Data\Managed</AssemblySearchPaths>
-    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="System.Reflection.Metadata" Version="8.0.0" />
-    <!-- Round 5: decompiling EFTInventoryClass.Equipment/.Stash's getters specifically - a tiny
-         property getter, not a whole type or a complex method. spt-hideout-shootout's own DumpTool
-         crashed with a StackOverflowException decompiling the game's own obfuscated assemblies at
-         type/method granularity before (its round 13), so this is scoped as narrow as possible and
-         still runs in an isolated child process so a crash here only loses this one lookup. -->
-    <PackageReference Include="ICSharpCode.Decompiler" Version="8.2.0.7535" />
-  </ItemGroup>
+  <!-- Round 5 v3: no NuGet packages needed - reads raw IL via plain System.Reflection instead of
+       ICSharpCode.Decompiler, after that failed resolving the game's netstandard.dll facade
+       against Queue<T> (its forwarding targets weren't all in the resolver's search path). -->
 
   <ItemGroup>
     <Reference Include="Assembly-CSharp">
