@@ -405,58 +405,71 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			// PORTING NOTE (SPT 4.0.13): this used to hand-convert every ResourceKey to a string
-			// (ToAssetName(), normalised to forward slashes with a ".bundle" suffix) and feed those to
-			// IAssetsManager.LoadBundlesAsync(string[]). Confirmed via DumpTool that this was wrong at
-			// the root: LoadBundlesAsync's IL runs its input through a name transform and then builds
-			// its operation with the mask "{0}:MainAsset", i.e. it wants BUNDLE names, while
-			// ToAssetName() - as the name says - returns an ASSET name. The two are different
-			// namespaces, so the operation was being handed names that resolve to nothing. That is why
-			// it never reported Succeed and never reported Failed either: in-game, with every bundle
-			// isolated in its own operation so no batch could be poisoned by a sibling, 0 of 4
-			// character-mesh bundles settled inside a full 20 second wait, and only already-resident
-			// bundles ever completed.
+			// PORTING NOTE (SPT 4.0.13): the long-running mystery here was that bundle loads never
+			// settled - not Succeed, not Failed, just permanently pending. Confirmed via the game's own
+			// Player.log what actually happens. The very first line after this method's first log
+			// message is:
 			//
-			// AssetsManagerClass/IAssetsManager also expose LoadAssetAsync(ResourceKey) - confirmed via
-			// DumpTool - which takes the ResourceKey the profile already hands us and does the
-			// key -> bundle resolution internally, the way the game does it for itself. That removes the
-			// string conversion (and its per-key-type inconsistencies) from the mod entirely.
+			//   The AssetBundle '.../StreamingAssets/Windows/cubemaps' can't be loaded because another
+			//   AssetBundle with the same files is already loaded.
+			//   Error while getting Asset Bundle: ...
 			//
-			// The other candidate was PoolManagerClass.LoadBundlesAndCreatePools, which is what the SPT
-			// 4.1 version of this mod called. Its IL resolves the pool for the category, converts the
-			// keys via Class1448.ConvertResourceInfo, then hands off to an async worker - but both it
-			// and that worker take a GDelegate62 parameter, a delegate type the CLR refuses to load
-			// ("delegate class must be sealed"), which makes GetParameters() and Invoke() throw. So it
-			// stays uncallable from mod code, and LoadAssetAsync is the reachable equivalent.
-			// ToAssetName() returns backslash-separated paths for some key types and forward-slash
-			// ones for others. Only used for classifying and logging now, but the slashes still have
-			// to be normalised first: without this every "/characters/character/" test below misses,
-			// which is exactly what happened in-game - every profile classified as mesh=0, so the
-			// character meshes landed in the gear bucket and only got its short wait.
-			string SafeAssetName(ResourceKey key)
+			// 59 of those, all inside this mod's spawn windows and none before it ran. Loading a
+			// character bundle pulls in its dependencies (cubemaps, shaders, per-weapon texture
+			// client_assets, physicsmaterials), the hideout already has those resident, Unity refuses to
+			// load a second copy, and the operation dies on the dependency without ever completing - so
+			// the character bundle itself is never loaded and LocalPlayer.Create throws "<head> is not
+			// loaded".
+			//
+			// So the fix is not a different entry point or a longer wait, it is to stop asking for
+			// things that are already loaded. BundlesManagerClass exposes exactly what is needed:
+			// FindBundle (is it resident?), FindDependences (what does it pull in?) and
+			// LoadBundleAsync(name, logErrors). Load dependencies first, skipping any that are already
+			// resident, then the bundle itself.
+			//
+			// The string format was right all along, incidentally - SPT's own BundleManager logs these
+			// as "Loading locally assets/content/characters/character/prefabs/<name>.bundle", i.e.
+			// forward slashes with a .bundle suffix, which is what NormalizeBundleName builds.
+			string NormalizeBundleName(ResourceKey key)
 			{
-				try { return key.ToAssetName()?.Replace('\\', '/') ?? string.Empty; }
-				catch { return string.Empty; }
+				string name;
+				try { name = key.ToAssetName(); }
+				catch { return null; }
+
+				if (string.IsNullOrEmpty(name))
+				{
+					return null;
+				}
+
+				name = name.Replace('\\', '/');
+				if (!name.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase))
+				{
+					name += ".bundle";
+				}
+
+				return name;
 			}
 
-			// Asset names are still useful for classifying and logging a key - just not for loading it.
-			bool IsCharacterMeshKey(ResourceKey key)
-			{
-				string name = SafeAssetName(key);
-				return name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0
-					|| name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0
-					|| name.IndexOf("/content/feet/", StringComparison.OrdinalIgnoreCase) >= 0;
-			}
+			bool IsCharacterMeshBundle(string name) =>
+				name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0
+				|| name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0
+				|| name.IndexOf("/content/feet/", StringComparison.OrdinalIgnoreCase) >= 0;
 
-			var meshKeys = resourceKeys.Where(IsCharacterMeshKey).ToArray();
-			var otherKeys = resourceKeys.Where(key => !IsCharacterMeshKey(key)).ToArray();
+			var bundleNames = resourceKeys
+				.Select(NormalizeBundleName)
+				.Where(name => !string.IsNullOrEmpty(name))
+				.Distinct()
+				.ToArray();
 
-			Logger.LogWarning($"Preloading {resourceKeys.Length} resource keys for profile {profile.Id}; mesh={meshKeys.Length} other={otherKeys.Length}.");
+			var meshBundles = bundleNames.Where(IsCharacterMeshBundle).ToArray();
+			var otherBundles = bundleNames.Where(name => !IsCharacterMeshBundle(name)).ToArray();
 
-			// Mesh keys decide whether the character has a body at all, so they get the longer wait and
-			// per-key reporting. Gear (weapons, rig, ammo) is cosmetic here and may lag behind.
-			await LoadResourceKeysAsync(meshKeys, 15, "character mesh", profile.Id, SafeAssetName, logEachFailure: true);
-			await LoadResourceKeysAsync(otherKeys, 5, "gear", profile.Id, SafeAssetName, logEachFailure: false);
+			Logger.LogWarning($"Preloading {bundleNames.Length} bundles for profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundles.Length} other={otherBundles.Length}.");
+
+			// Mesh bundles decide whether the character has a body at all, so they get the longer wait
+			// and per-bundle reporting. Gear is cosmetic here and may lag behind.
+			await LoadBundlesAsync(meshBundles, 15, "character mesh", profile.Id, logEachFailure: true);
+			await LoadBundlesAsync(otherBundles, 5, "gear", profile.Id, logEachFailure: false);
 		}
 
 		/// <summary>
@@ -466,46 +479,98 @@ namespace SevenBoldPencil.TargetDummies
 		/// <see cref="PreloadProfileBundlesAsync"/>. Per-key operations also mean an unreachable
 		/// resource only ever stalls itself.
 		/// </summary>
-		private async Task LoadResourceKeysAsync(
-			ResourceKey[] keys,
+		private async Task LoadBundlesAsync(
+			string[] bundleNames,
 			double timeoutSeconds,
 			string label,
 			string profileId,
-			Func<ResourceKey, string> describe,
 			bool logEachFailure)
 		{
-			if (keys.Length == 0)
+			if (bundleNames.Length == 0)
 			{
 				return;
 			}
 
-			var assetsManager = AssetsManagerSingletonClass.Manager;
-			if (assetsManager == null)
+			var bundlesManager = TryGetBundlesManager();
+			if (bundlesManager == null)
 			{
+				Logger.LogWarning($"BundlesManager is unavailable; {label} bundles for profile {profileId} cannot be preloaded.");
 				return;
 			}
 
-			var pending = new List<PendingBundleLoad>(keys.Length);
-			foreach (var key in keys)
+			// A bundle's dependencies have to be resident before it will load, but asking for one that
+			// is ALREADY resident is what was killing these operations - so build the full set
+			// (dependencies first, then the bundle) and drop everything already loaded.
+			var wanted = new List<string>();
+			var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+			void Want(string name)
+			{
+				if (string.IsNullOrEmpty(name) || !seen.Add(name))
+				{
+					return;
+				}
+
+				try
+				{
+					if (bundlesManager.FindBundle(name) != null)
+					{
+						return; // already resident - requesting it again is the error we are avoiding
+					}
+				}
+				catch (Exception ex)
+				{
+					Logger.LogDebug($"FindBundle('{name}') threw: {ex.Message}");
+				}
+
+				wanted.Add(name);
+			}
+
+			foreach (var name in bundleNames)
+			{
+				try
+				{
+					var dependencies = bundlesManager.FindDependences(name);
+					if (dependencies != null)
+					{
+						foreach (var dependency in dependencies)
+						{
+							Want(dependency);
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Logger.LogDebug($"FindDependences('{name}') threw: {ex.Message}");
+				}
+
+				Want(name);
+			}
+
+			if (wanted.Count == 0)
+			{
+				Logger.LogWarning($"{label} for profile {profileId}: all {bundleNames.Length} already resident, nothing to load.");
+				return;
+			}
+
+			var pending = new List<PendingBundleLoad>(wanted.Count);
+			foreach (var name in wanted)
 			{
 				try
 				{
 					var load = new PendingBundleLoad
 					{
-						Name = describe(key),
+						Name = name,
 						Tcs = new TaskCompletionSource<bool>(),
 					};
 
-					// Held as object so this compiles regardless of whether IOperation<T> derives from
-					// the non-generic IOperation - see OperationSucceeded below.
-					var operation = assetsManager.LoadAssetAsync(key);
-					load.Operation = operation;
-					StartCoroutine(DriveOperationCoroutine(operation, load.Tcs));
+					load.Operation = bundlesManager.LoadBundleAsync(name, false);
+					StartCoroutine(DriveOperationCoroutine(load.Operation, load.Tcs));
 					pending.Add(load);
 				}
 				catch (Exception ex)
 				{
-					Logger.LogWarning($"Could not start a {label} load for '{describe(key)}': {ex.Message}");
+					Logger.LogWarning($"Could not start a {label} load for '{name}': {ex.Message}");
 				}
 			}
 
@@ -527,7 +592,7 @@ namespace SevenBoldPencil.TargetDummies
 
 			if (stuck.Length == 0 && failed.Length == 0)
 			{
-				Logger.LogWarning($"{label} for profile {profileId}: all {pending.Count} loaded.");
+				Logger.LogWarning($"{label} for profile {profileId}: all {pending.Count} loaded ({seen.Count - pending.Count} were already resident).");
 				return;
 			}
 
@@ -540,6 +605,24 @@ namespace SevenBoldPencil.TargetDummies
 			else
 			{
 				Logger.LogWarning($"{label} for profile {profileId}: {loaded}/{pending.Count} loaded ({stuck.Length} never settled, {failed.Length} failed). Proceeding anyway.");
+			}
+		}
+
+		/// <summary>
+		/// Resolves the BundlesManager behind the asset manager singleton. AssetsManagerSingletonClass
+		/// hands back the IAssetsManager interface, which does not expose it, so reach through the
+		/// concrete AssetsManagerClass.
+		/// </summary>
+		private static BundlesManagerClass TryGetBundlesManager()
+		{
+			try
+			{
+				return AssetsManagerSingletonClass.Manager is AssetsManagerClass concrete ? concrete.BundlesManager : null;
+			}
+			catch (Exception ex)
+			{
+				Plugin.Instance?.LoggerInstance?.LogWarning($"Could not resolve BundlesManager: {ex.Message}");
+				return null;
 			}
 		}
 
@@ -572,7 +655,7 @@ namespace SevenBoldPencil.TargetDummies
 			}
 		}
 
-		/// <summary>One in-flight resource load started by <see cref="LoadResourceKeysAsync"/>.</summary>
+		/// <summary>One in-flight bundle load started by <see cref="LoadBundlesAsync"/>.</summary>
 		private sealed class PendingBundleLoad
 		{
 			public string Name;
