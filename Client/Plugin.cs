@@ -798,17 +798,34 @@ namespace SevenBoldPencil.TargetDummies
 			// (usually a randomized "wild_head_N"/"wild_head_misha" scav head variant) hadn't
 			// finished loading yet. Waiting for each mannequin's full spawn to finish before
 			// starting the next removes the contention entirely.
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - some randomly-assigned bot appearances
+			// (a mod-added head/body template with a broken bundle reference) can make the whole
+			// SpawnBot Task hang indefinitely - not throw, not time out via
+			// PreloadProfileBundlesAsync's own 90s cutoff, just never complete (ModProfiler showed
+			// WaitForTask spinning every frame with SpawnBot's Task never finishing, for the entire
+			// rest of the session). Since that hang can happen inside game/BSG code this mod doesn't
+			// control (IAssetsManager.LoadBundlesAsync's own operation, or LocalPlayer.Create itself),
+			// a hard per-mannequin wall-clock cap here is the only way to guarantee one bad slot
+			// can't block the other 5 forever - the abandoned Task keeps running in the background
+			// and is simply never awaited past this point.
 			foreach (var data in new[] { closeLeft, closeMiddle, closeRight, farLeft, farMiddle, farRight })
 			{
-				yield return WaitForTask(SpawnBot(data));
+				yield return WaitForTaskOrTimeout(SpawnBot(data), 120f);
 			}
 		}
 
-		private static IEnumerator WaitForTask(Task task)
+		private IEnumerator WaitForTaskOrTimeout(Task task, float timeoutSeconds)
 		{
-			while (!task.IsCompleted)
+			float elapsed = 0f;
+			while (!task.IsCompleted && elapsed < timeoutSeconds)
 			{
 				yield return null;
+				elapsed += Time.deltaTime;
+			}
+
+			if (!task.IsCompleted)
+			{
+				Logger.LogWarning($"A mannequin spawn did not finish within {timeoutSeconds}s; abandoning it and moving on to the next slot.");
 			}
 		}
 
