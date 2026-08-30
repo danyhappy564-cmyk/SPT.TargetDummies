@@ -86,24 +86,21 @@ namespace SevenBoldPencil.TargetDummies
 				return;
 			}
 
-			// PORTING NOTE (SPT 4.0.13, diagnostic): confirmed in-game that mannequins die and
-			// ragdoll correctly, but never respawn - meaning either this prefix never fires for
-			// hideout ragdolls, Action_0 never actually invokes the subscribed callback (wrong
-			// field guess), or PlayerBody_0.TryGetComponent<LocalPlayer> fails to resolve. Logging
-			// every step so the next test's log shows exactly which one.
-			Plugin.Instance.LoggerInstance.LogWarning($"Patch_CorpseRagdoll_Start.Prefix fired for a hideout ragdoll (instance={__instance}).");
-
 			__instance.Action_0 += () =>
 			{
-				Plugin.Instance.LoggerInstance.LogWarning("RagdollClass.Action_0 callback fired.");
-				if (__instance.PlayerBody_0.TryGetComponent<LocalPlayer>(out var localPlayer))
+				// PORTING NOTE (SPT 4.0.13): confirmed in-game - Action_0 does fire correctly (it is
+				// the right "ragdoll settled" event), but PlayerBody_0.TryGetComponent<LocalPlayer>
+				// always failed, every time. TryGetComponent only checks the exact same GameObject;
+				// LocalPlayer isn't on the same object as PlayerBody in this client's hierarchy.
+				// GetComponentInParent walks up to find it instead.
+				var localPlayer = __instance.PlayerBody_0.GetComponentInParent<LocalPlayer>();
+				if (localPlayer != null)
 				{
-					Plugin.Instance.LoggerInstance.LogWarning($"Resolved LocalPlayer from PlayerBody_0; calling OnBotDeath for profile {localPlayer.Profile?.Id}.");
 					Plugin.Instance.OnBotDeath(localPlayer);
 				}
 				else
 				{
-					Plugin.Instance.LoggerInstance.LogWarning("Could not resolve LocalPlayer component from RagdollClass.PlayerBody_0; OnBotDeath not called.");
+					Plugin.Instance.LoggerInstance.LogWarning("Could not resolve LocalPlayer from RagdollClass.PlayerBody_0 (checked parents too); OnBotDeath not called.");
 				}
 			};
 		}

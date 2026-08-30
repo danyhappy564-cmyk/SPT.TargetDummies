@@ -410,20 +410,21 @@ namespace SevenBoldPencil.TargetDummies
 
 			// PORTING NOTE (SPT 4.0.13): confirmed in-game - waiting for the WHOLE batch to report
 			// Succeed==true never worked reliably in this modded environment, even with as few as
-			// 5-6 bundles requested (still hit the full timeout). The batch operation appears to
-			// never resolve to Succeed OR Failed if even one individual bundle in it is permanently
-			// unreachable - it just hangs until an external caller gives up, regardless of how small
-			// or "safe" the rest of the batch is. Waiting longer doesn't help since a permanently
-			// missing bundle never arrives no matter how long we wait.
+			// 5 bundles requested (a fixed mannequin skin, no random gear at all). Every single
+			// spawn hits the same shape: 4 of the 5 resolve almost immediately, and the 5th (a
+			// voice/animation-bank reference like "BossTagilla.bundle" with no consistent naming
+			// pattern to filter on - unlike the audio/ path ones already excluded above) never
+			// resolves no matter how long the wait. The batch operation appears to never resolve to
+			// Succeed OR Failed if even one bundle in it is permanently unreachable - it just hangs
+			// until an external caller gives up.
 			//
-			// Tried the strict alternative (skip the mannequin entirely on a timeout/failure) - that
-			// produced zero spawns at all, which is worse for this mod's actual purpose (a visible,
-			// shootable target) than a mannequin with an imperfect bundle set. Back to a short wait
-			// (15s - enough for the fast majority of bundles to resolve) and then proceeding
-			// regardless: some spawned mannequins may have missing gear pieces or not react to hits
-			// if their specific missing bundle turned out to matter, but at least something is there
-			// to look at instead of nothing.
-			const double timeoutSeconds = 15;
+			// Since real content consistently finishes almost immediately and the remainder never
+			// finishes no matter how long we wait, a short timeout wastes far less time than a long
+			// one for the same outcome - cut from 15s to 5s (confirmed via the "20-30s per
+			// mannequin" complaint that most of that time was this wait, not LocalPlayer.Create
+			// itself). Skipping the mannequin entirely on a timeout was tried and reverted - that
+			// produced zero spawns at all, worse than one with a missing gear/voice piece.
+			const double timeoutSeconds = 5;
 			var waitStart = DateTime.UtcNow;
 			while (true)
 			{
