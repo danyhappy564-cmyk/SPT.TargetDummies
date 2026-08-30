@@ -153,13 +153,15 @@ namespace SevenBoldPencil.TargetDummies
             }
 
 			// PORTING NOTE (SPT 4.0.13): the field is Task_0 (capital T) here, not task_0 - same
-			// Task<GStruct156<HideoutGame>> shape, confirmed via DumpTool.
+			// Task<GStruct156<HideoutGame>> shape, confirmed via DumpTool. GameWorld/Profile are
+			// GameWorld_0/Profile_0 here (both declared on the BaseLocalGame<HideoutPlayerOwner>
+			// base class), also confirmed via DumpTool.
 			var hideoutController = tarkovApplication.HideoutControllerAccess;
 			var hideoutGame = hideoutController.Task_0.Result.Value;
-			var hideoutGameWorld = hideoutGame.GameWorld;
+			var hideoutGameWorld = hideoutGame.GameWorld_0;
 			var localPlayerPosition = new Vector3(-2.5263f, 0f, 9.3481f);
 
-			var botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile, data.Type.Value);
+			var botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile_0, data.Type.Value);
 
 			// PORTING NOTE (SPT 4.0.13): confirmed by spt-hideout-shootout's own backport - the
 			// hands-rig bundle (assets/content/hands/*.bundle) is never loadable outside a real
@@ -186,7 +188,12 @@ namespace SevenBoldPencil.TargetDummies
 			// conversion in turn since which one "works" isn't documented.
 			await PreloadProfileBundlesAsync(botPlayerProfile);
 
-			var botPlayerId = hideoutGame.NextPlayerId();
+			// PORTING NOTE (SPT 4.0.13): HideoutGame/BaseLocalGame<HideoutPlayerOwner> has no method
+			// matching NextPlayerId (confirmed via DumpTool - no Player/Id/World/Profile-named
+			// method exists on the whole base chain up to AbstractGame). A random id in a range
+			// vanilla players won't collide with is all LocalPlayer.Create actually needs -
+			// spt-hideout-shootout's own backport uses the exact same approach for its hideout bots.
+			var botPlayerId = UnityEngine.Random.Range(100000, int.MaxValue);
 			var rotation = Quaternion.LookRotation((localPlayerPosition - data.Position).normalized);
 
 			// PORTING NOTE (SPT 4.0.13): AppEnvironment.Config.CharacterController.BotPlayerMode has
