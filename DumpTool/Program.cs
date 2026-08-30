@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -10,42 +9,12 @@ using System.Text;
 // SPT 4.0.13 backport can be fixed against actual signatures instead of guesses. Not part of
 // the mod - delete this project once the backport is done.
 //
-// Round 5 (v2): the first round-5 attempt crashed the PARENT process immediately, before writing
-// anything - most likely because DecompilerHelper's static field
-// (Dictionary<string, CSharpDecompiler>) forced the CLR to resolve ICSharpCode.Decompiler's types
-// at Program's class-load time, even though the parent never actually decompiles anything itself
-// (only the --decompile-one child process does). Moved every ICSharpCode.Decompiler-touching type
-// into its own class (Decompiling, in DecompileWorker.cs) that only RunDecompileWorker references,
-// so the parent process's Main() never triggers loading that assembly at all. Also swapped
-// Process.GetCurrentProcess().MainModule.FileName (native process introspection, another possible
-// crash source) for the simpler Assembly.GetExecutingAssembly().Location.
+// Round 6: EFT.HideoutGame doesn't have GameWorld/Profile/NextPlayerId directly - plain reflection
+// dump (no decompiling needed this time) of its full member list, own + inherited, plus its base
+// type chain, to find whatever replaced them.
 class Program
 {
     static void Main(string[] args)
-    {
-        if (args.Length > 0 && args[0] == "--decompile-one")
-        {
-            DecompileWorker.Run(args);
-            return;
-        }
-
-        try
-        {
-            RunParent(args);
-        }
-        catch (Exception ex)
-        {
-            // Deliberately not using ex.ToString() here - if something is bad enough for that to
-            // itself throw, at least the type name/message printed via string concatenation (not
-            // interpolation-driven formatting of the whole exception) has a chance of getting out.
-            string message = "Fatal error in DumpTool: " + ex.GetType().FullName + ": " + ex.Message
-                + "\n" + ex.StackTrace;
-            Console.WriteLine(message);
-            try { File.WriteAllText("crash.txt", message, Encoding.UTF8); } catch { }
-        }
-    }
-
-    static void RunParent(string[] args)
     {
         string sptRoot = args.Length > 0 ? args[0] : @"E:\SPT 4.0.10";
         string managedDir = Path.Combine(sptRoot, "EscapeFromTarkov_Data", "Managed");
@@ -57,74 +26,104 @@ class Program
             return;
         }
 
-        using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
-
-        w.WriteLine("=== decompiling EFTInventoryClass.Equipment / .Stash getters (child-process isolated) ===");
-        w.Flush();
-
-        string exePath = Assembly.GetExecutingAssembly().Location;
-
-        void RunOne(string header, string methodName)
+        AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
         {
-            w.WriteLine("--- " + header + " ---");
-            w.Flush();
+            string name = new AssemblyName(e.Name).Name;
+            string path = Path.Combine(managedDir, name + ".dll");
+            return File.Exists(path) ? Assembly.LoadFrom(path) : null;
+        };
 
-            string outFile = Path.GetTempFileName();
+        var allTypes = new List<Type>();
+        foreach (string dllPath in Directory.GetFiles(managedDir, "*.dll"))
+        {
+            string fileName = Path.GetFileNameWithoutExtension(dllPath);
+            if (fileName.StartsWith("UnityEngine.", StringComparison.OrdinalIgnoreCase)
+                || fileName.StartsWith("Unity.", StringComparison.OrdinalIgnoreCase)
+                || fileName.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
+                || fileName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase)
+                || fileName is "mscorlib" or "netstandard" or "UnityEngine")
+            {
+                continue;
+            }
+
             try
             {
-                var workerArgs = new List<string> { "--decompile-one", sptRoot, outFile, "EFTInventoryClass", methodName };
-                var psi = new ProcessStartInfo
-                {
-                    FileName = exePath,
-                    // ProcessStartInfo.ArgumentList isn't available on net48 - build the command
-                    // line by hand, quoting every argument (sptRoot alone contains a space).
-                    Arguments = string.Join(" ", workerArgs.Select(a => "\"" + a.Replace("\"", "\\\"") + "\"")),
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-
-                using (Process proc = Process.Start(psi))
-                {
-                    bool exited = proc.WaitForExit(30000);
-                    if (!exited)
-                    {
-                        try { proc.Kill(); } catch { }
-                        w.WriteLine("  <decompile worker timed out after 30s>");
-                    }
-                    else if (proc.ExitCode != 0)
-                    {
-                        w.WriteLine($"  <decompile worker crashed or exited with code {proc.ExitCode}>");
-                    }
-                    else if (File.Exists(outFile) && new FileInfo(outFile).Length > 0)
-                    {
-                        w.WriteLine(File.ReadAllText(outFile, Encoding.UTF8));
-                    }
-                    else
-                    {
-                        w.WriteLine("  <worker exited cleanly but produced no output>");
-                    }
-                }
+                var asm = Assembly.LoadFrom(dllPath);
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray(); }
+                allTypes.AddRange(types);
             }
-            catch (Exception ex)
+            catch
             {
-                w.WriteLine("  <failed to run decompile worker: " + ex.Message + ">");
+                // ignore load failures
             }
-            finally
-            {
-                try { if (File.Exists(outFile)) File.Delete(outFile); } catch { }
-            }
-
-            w.WriteLine();
-            w.Flush();
         }
 
-        RunOne("EFTInventoryClass.get_Equipment", "get_Equipment");
-        RunOne("EFTInventoryClass.get_Stash", "get_Stash");
-        // Both getters call this before reading their backing field - need to know whether it's a
-        // lazy-build-once guard (safe to pre-set the field directly) or an unconditional rebuild
-        // from Gclass1390_0/FastAccess every call (which would clobber a directly-set field).
-        RunOne("EFTInventoryClass.method_0", "method_0");
+        using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
+
+        Type hideoutGameType = allTypes.FirstOrDefault(t => t.FullName == "EFT.HideoutGame");
+        if (hideoutGameType == null)
+        {
+            w.WriteLine("EFT.HideoutGame not found.");
+            w.Flush();
+            Console.WriteLine("Wrote dump.txt");
+            return;
+        }
+
+        w.WriteLine("=== EFT.HideoutGame base type chain ===");
+        for (Type bt = hideoutGameType; bt != null; bt = bt.BaseType)
+        {
+            w.WriteLine("  " + bt);
+        }
+        w.Flush();
+
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+            | BindingFlags.Instance | BindingFlags.FlattenHierarchy;
+
+        w.WriteLine();
+        w.WriteLine("=== EFT.HideoutGame properties (own + inherited) ===");
+        foreach (var p in SafeGet(() => hideoutGameType.GetProperties(flags)))
+        {
+            w.WriteLine("  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name + " (declared on " + p.DeclaringType + ")");
+        }
+        w.Flush();
+
+        w.WriteLine();
+        w.WriteLine("=== EFT.HideoutGame fields (own + inherited) ===");
+        foreach (var f in SafeGet(() => hideoutGameType.GetFields(flags)))
+        {
+            w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + " (declared on " + f.DeclaringType + ")");
+        }
+        w.Flush();
+
+        w.WriteLine();
+        w.WriteLine("=== EFT.HideoutGame methods matching Player/Id/World/Profile (own + inherited) ===");
+        foreach (var m in SafeGet(() => hideoutGameType.GetMethods(flags).Where(m => !m.IsSpecialName).ToArray()))
+        {
+            if (m.Name.IndexOf("Player", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.Name.IndexOf("World", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.Name.IndexOf("Profile", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.Name.IndexOf("Id", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                w.WriteLine("  method: " + m + " (declared on " + m.DeclaringType + ")");
+            }
+        }
+        w.Flush();
 
         Console.WriteLine("Wrote dump.txt");
+    }
+
+    static T[] SafeGet<T>(Func<T[]> get)
+    {
+        try { return get(); }
+        catch { return Array.Empty<T>(); }
+    }
+
+    static string SafeTypeName(Type t)
+    {
+        if (t == null) return "null";
+        try { return t.ToString(); }
+        catch (Exception ex) { return "<?:" + ex.GetType().Name + ">"; }
     }
 }
