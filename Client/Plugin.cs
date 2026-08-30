@@ -199,10 +199,10 @@ namespace SevenBoldPencil.TargetDummies
 			// but several argument types/sources are 4.1-only and don't exist here:
 			// - LocalGame.CG_Class1642.CG_Class1642.method_4/method_5 (obfuscated 4.1 sensitivity
 			//   callbacks) -> plain () => 1f lambdas (mannequins don't move the camera anyway).
-			// - DumbStatisticsManager -> GClass2265 (same dependency-free IStatisticsManager shape).
-			// - ThirdPersonCustomizationFilter.Default -> GClass1855.Default (one of two concrete
-			//   IViewFilter siblings; verify in-game that the mannequin's customization renders
-			//   correctly in third person - if not, try GClass1856.Default instead).
+			// - DumbStatisticsManager -> GClass2265 (confirmed via SPT's own 4.0->4.1 class name
+			//   mapping table).
+			// - ThirdPersonCustomizationFilter.Default -> GClass1856.Default (also confirmed via the
+			//   mapping table - GClass1855 is the sibling PlayerCustomizationFilter, not this one).
 			// Passed positionally rather than by name since the obfuscated build's real parameter
 			// names aren't confirmed to match 4.1's.
 			LocalPlayer botPlayer;
@@ -225,7 +225,7 @@ namespace SevenBoldPencil.TargetDummies
 					new Func<float>(() => 1f),
 					new Func<float>(() => 1f),
 					new GClass2265(),
-					GClass1855.Default,
+					GClass1856.Default,
 					null,
 					ELocalMode.TRAINING,
 					false,

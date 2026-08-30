@@ -12,6 +12,8 @@
     <Reference Include="Assembly-CSharp" />
     <Reference Include="BepInEx" />
     <Reference Include="Comfort" />
+    <!-- IOperation (used to drive AssetsManager.LoadBundlesAsync) lives here, not in Comfort. -->
+    <Reference Include="Comfort.Unity" />
     <Reference Include="DOTween" />
     <Reference Include="Newtonsoft.Json" />
     <Reference Include="Sirenix.Serialization" />

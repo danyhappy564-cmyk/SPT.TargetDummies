@@ -65,7 +65,6 @@ class Program
 
         using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
         const BindingFlags instanceFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
-        const BindingFlags staticFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly;
 
         // 1) CorpseRagdoll search + PlayerBody chain first - cheapest, and round 2 never reached
         // this because it ran after the (crashing) deep recursion.
@@ -120,51 +119,79 @@ class Program
         }
         w.Flush();
 
-        // 3) EFT.MongoID's static members - need the replacement for MongoID.Generate(bool).
-        w.WriteLine();
-        w.WriteLine("=== EFT.MongoID static members ===");
-        Type mongoIdType = allTypes.FirstOrDefault(t => t.FullName == "EFT.MongoID");
-        if (mongoIdType == null)
-        {
-            w.WriteLine("  not found");
-        }
-        else
-        {
-            foreach (var m in SafeGet(() => mongoIdType.GetMethods(staticFlags).Where(m => !m.IsSpecialName).ToArray()))
-            {
-                w.WriteLine("  method: " + m + (m.IsPublic ? " [public]" : " [non-public]"));
-            }
-            foreach (var f in SafeGet(() => mongoIdType.GetFields(staticFlags)))
-            {
-                w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
-            }
-        }
-        w.Flush();
+        // Rounds 1-3 already answered CorpseRagdoll/PlayerBody/MongoID/InventoryDescriptorClass -
+        // removed from this round to keep output small. Round 4 targets the 3 new unknowns from
+        // the latest compile errors.
 
-        // 4) InventoryDescriptorClass's own direct members only - no recursion at all, this is
-        // exactly the type that likely triggered round 2's crash once the recursion reached it
-        // (Item/Slot graphs tend to be huge and cross-referential).
-        w.WriteLine();
-        w.WriteLine("=== InventoryDescriptorClass direct members (no recursion) ===");
-        Type inventoryDescriptorType = allTypes.FirstOrDefault(t => t.FullName == "InventoryDescriptorClass" || t.Name == "InventoryDescriptorClass");
-        if (inventoryDescriptorType == null)
+        // 5) WaveInfoClass - the compile error already told us session.LoadBots wants
+        // List<WaveInfoClass> instead of 4.1's List<CountTypeBotWave>; need its ctor shape.
+        w.WriteLine("=== WaveInfoClass (replaces CountTypeBotWave) ===");
+        Type waveInfoType = allTypes.FirstOrDefault(t => t.Name == "WaveInfoClass");
+        if (waveInfoType == null)
         {
             w.WriteLine("  not found");
         }
         else
         {
-            foreach (var ctor in SafeGet(() => inventoryDescriptorType.GetConstructors(instanceFlags)))
+            w.WriteLine("  FullName: " + waveInfoType.FullName);
+            foreach (var ctor in SafeGet(() => waveInfoType.GetConstructors(instanceFlags)))
             {
                 var pars = SafeGet(() => ctor.GetParameters());
                 w.WriteLine("  ctor(" + string.Join(", ", pars.Select(p => SafeTypeName(p.ParameterType) + " " + p.Name)) + ")" + (ctor.IsPublic ? " [public]" : " [non-public]"));
             }
-            foreach (var f in SafeGet(() => inventoryDescriptorType.GetFields(instanceFlags)))
+            foreach (var f in SafeGet(() => waveInfoType.GetFields(instanceFlags)))
             {
                 w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
             }
-            foreach (var p in SafeGet(() => inventoryDescriptorType.GetProperties(instanceFlags)))
+            foreach (var p in SafeGet(() => waveInfoType.GetProperties(instanceFlags)))
             {
                 w.WriteLine("  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
+            }
+        }
+        w.Flush();
+
+        // 6) EFT.InventoryLogic.EBoundItem's real enum member names - the Equipment guess was wrong.
+        w.WriteLine();
+        w.WriteLine("=== EFT.InventoryLogic.EBoundItem enum values ===");
+        Type eBoundItemType = allTypes.FirstOrDefault(t => t.FullName == "EFT.InventoryLogic.EBoundItem");
+        if (eBoundItemType == null)
+        {
+            w.WriteLine("  not found");
+        }
+        else
+        {
+            w.WriteLine("  " + string.Join(", ", Enum.GetNames(eBoundItemType)));
+        }
+        w.Flush();
+
+        // 7) TarkovApplication.HideoutControllerAccess's actual return type members - task_0
+        // doesn't exist on it (per the compile error), need whatever field/prop replaces it.
+        w.WriteLine();
+        w.WriteLine("=== TarkovApplication.HideoutControllerAccess return type members ===");
+        Type tarkovAppType = allTypes.FirstOrDefault(t => t.Name == "TarkovApplication");
+        if (tarkovAppType == null)
+        {
+            w.WriteLine("  TarkovApplication not found");
+        }
+        else
+        {
+            PropertyInfo hideoutControllerAccessProp = tarkovAppType.GetProperty("HideoutControllerAccess", instanceFlags | BindingFlags.FlattenHierarchy);
+            if (hideoutControllerAccessProp == null)
+            {
+                w.WriteLine("  HideoutControllerAccess property not found on TarkovApplication");
+            }
+            else
+            {
+                Type accessType = hideoutControllerAccessProp.PropertyType;
+                w.WriteLine("  HideoutControllerAccess : " + accessType.FullName);
+                foreach (var f in SafeGet(() => accessType.GetFields(instanceFlags)))
+                {
+                    w.WriteLine("    field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
+                }
+                foreach (var p in SafeGet(() => accessType.GetProperties(instanceFlags)))
+                {
+                    w.WriteLine("    prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
+                }
             }
         }
         w.Flush();
