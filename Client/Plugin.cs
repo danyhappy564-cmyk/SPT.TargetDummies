@@ -754,13 +754,25 @@ namespace SevenBoldPencil.TargetDummies
 			var farMiddle = new MannequinData(new(-2.75f, 0.01f, 57.47f), FarMiddleMannequinType);
 			var farRight = new MannequinData(new(-0.56f, 0.01f, 57.47f), FarRightMannequinType);
 
-			SpawnBot(closeLeft);
-			SpawnBot(closeMiddle);
-			SpawnBot(closeRight);
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - firing all 6 SpawnBot calls at once
+			// (as 4.1's original fire-and-forget code did) makes their bundle preloads compete for
+			// the asset manager at the same time, and PreloadProfileBundlesAsync's 20s timeout was
+			// hit for every single one, with LocalPlayer.Create then throwing on whichever bundle
+			// (usually a randomized "wild_head_N"/"wild_head_misha" scav head variant) hadn't
+			// finished loading yet. Waiting for each mannequin's full spawn to finish before
+			// starting the next removes the contention entirely.
+			foreach (var data in new[] { closeLeft, closeMiddle, closeRight, farLeft, farMiddle, farRight })
+			{
+				yield return WaitForTask(SpawnBot(data));
+			}
+		}
 
-			SpawnBot(farLeft);
-			SpawnBot(farMiddle);
-			SpawnBot(farRight);
+		private static IEnumerator WaitForTask(Task task)
+		{
+			while (!task.IsCompleted)
+			{
+				yield return null;
+			}
 		}
 
 		public void OnBotDeath(LocalPlayer bot)
