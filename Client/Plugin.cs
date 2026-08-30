@@ -212,31 +212,54 @@ namespace SevenBoldPencil.TargetDummies
 			//   mapping table - GClass1855 is the sibling PlayerCustomizationFilter, not this one).
 			// Passed positionally rather than by name since the obfuscated build's real parameter
 			// names aren't confirmed to match 4.1's.
-			LocalPlayer botPlayer;
-			using (SuppressDisableDevMaskCheckPatch())
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - even with the bundle preload above
+			// waiting up to a minute and running one mannequin at a time (no more contention),
+			// LocalPlayer.Create still occasionally throws "<bundle> is not loaded" for a
+			// randomized character-mesh bundle (e.g. a scav's "wild_head_N"/"wild_head_misha", or a
+			// "bear_head_N" variant) that GetAllPrefabPaths apparently doesn't always resolve to a
+			// name IAssetsManager.LoadBundlesAsync can find in time - matching spt-hideout-shootout's
+			// own finding that the base character rig arrives via a separate mechanism in a real
+			// raid (InGameBundles.BUNDLES_TO_PRELOAD during GameWorld.InitLevel) that never runs in
+			// the hideout. Retrying after a short delay lets whatever background load is still in
+			// flight catch up, without needing to know the exact bundle-loading gap.
+			LocalPlayer botPlayer = null;
+			const int maxAttempts = 4;
+			for (int attempt = 1; attempt <= maxAttempts; attempt++)
 			{
-				botPlayer = await LocalPlayer.Create(
-					hideoutGameWorld,
-					botPlayerId,
-					data.Position,
-					rotation,
-					"Player",
-					"",
-					EPointOfView.ThirdPerson,
-					botPlayerProfile,
-					true,
-					hideoutGame.UpdateQueue,
-					Player.EUpdateMode.Auto,
-					Player.EUpdateMode.Auto,
-					botControllerMode,
-					new Func<float>(() => 1f),
-					new Func<float>(() => 1f),
-					new GClass2265(),
-					GClass1856.Default,
-					null,
-					ELocalMode.TRAINING,
-					false,
-					true);
+				try
+				{
+					using (SuppressDisableDevMaskCheckPatch())
+					{
+						botPlayer = await LocalPlayer.Create(
+							hideoutGameWorld,
+							botPlayerId,
+							data.Position,
+							rotation,
+							"Player",
+							"",
+							EPointOfView.ThirdPerson,
+							botPlayerProfile,
+							true,
+							hideoutGame.UpdateQueue,
+							Player.EUpdateMode.Auto,
+							Player.EUpdateMode.Auto,
+							botControllerMode,
+							new Func<float>(() => 1f),
+							new Func<float>(() => 1f),
+							new GClass2265(),
+							GClass1856.Default,
+							null,
+							ELocalMode.TRAINING,
+							false,
+							true);
+					}
+					break;
+				}
+				catch (Exception ex) when (attempt < maxAttempts && ex.Message.IndexOf("is not loaded", StringComparison.OrdinalIgnoreCase) >= 0)
+				{
+					Logger.LogWarning($"LocalPlayer.Create attempt {attempt}/{maxAttempts} for mannequin profile {botPlayerProfile.Id} failed ({ex.Message}); retrying in 5s.");
+					await Task.Delay(5000);
+				}
 			}
 
 			if (botPlayer == null)
@@ -349,7 +372,12 @@ namespace SevenBoldPencil.TargetDummies
 			var tcs = new TaskCompletionSource<bool>();
 			StartCoroutine(DriveOperationCoroutine(operation, tcs));
 
-			const double timeoutSeconds = 20;
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game a single mannequin's full bundle set
+			// (gear + character mesh) can take upward of 30s outside a real raid's loading screen -
+			// 20s was cutting this off too early even with spawns serialized (no contention). 90s
+			// gives real headroom; LocalPlayer.Create below also retries if a bundle still wasn't
+			// ready by the time this returns.
+			const double timeoutSeconds = 90;
 			var waitStart = DateTime.UtcNow;
 			while (true)
 			{
