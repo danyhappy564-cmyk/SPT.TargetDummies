@@ -231,13 +231,23 @@ namespace SevenBoldPencil.TargetDummies
 		private static bool _shotDelegateWireAttempted;
 
 		/// <summary>
-		/// Allows the wiring below to run again. Needed after a refresh replaces every mannequin:
-		/// HollywoodFX registers the players it knows about when it is wired, so bots created
-		/// afterwards get no hit effects and just stand there rigid until it is redone.
+		/// Re-runs the wiring so HollywoodFX picks up mannequins that did not exist last time.
 		/// </summary>
-		internal static void ResetShotDelegateWiring()
+		/// <remarks>
+		/// PORTING NOTE (SPT 4.0.13): HollywoodFX's GameWorldStartedPostfixPatch registers the
+		/// players present at the moment it runs. Anything spawned afterwards is not in its registry
+		/// and gets no hit effects at all - it just stands there rigid and never bleeds. So this has
+		/// to be called AFTER a mannequin is in the world, which is also why an earlier attempt at
+		/// this failed: it re-wired before respawning, when the old mannequins were already gone and
+		/// the new ones did not exist yet, so nothing at all got registered.
+		///
+		/// Only the player-registration half actually repeats. The shot-delegate wrapper is global
+		/// and detects that it is already wired, so re-running is cheap and safe.
+		/// </remarks>
+		internal static void RewireForNewPlayers()
 		{
 			_shotDelegateWireAttempted = false;
+			TryWireShotDelegateOnce();
 		}
 
 		/// <summary>
