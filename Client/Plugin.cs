@@ -335,6 +335,9 @@ namespace SevenBoldPencil.TargetDummies
 				.Distinct()
 				.ToArray();
 
+			bool anyHeadBundleRequested = bundleNames.Any(n => n.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0);
+			Logger.LogWarning($"Preloading {bundleNames.Length} bundle names for mannequin profile {profile.Id} ({resourceKeys.Length} resource keys); anyHeadBundleRequested={anyHeadBundleRequested}. Sample: {string.Join(" | ", bundleNames.Take(10))}");
+
 			if (bundleNames.Length == 0)
 			{
 				Logger.LogWarning($"No usable bundle names were produced for mannequin profile {profile.Id}; proceeding anyway.");
