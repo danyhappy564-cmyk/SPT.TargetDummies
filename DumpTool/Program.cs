@@ -9,11 +9,12 @@ using System.Text;
 // SPT 4.0.13 backport can be fixed against actual signatures instead of guesses. Not part of
 // the mod - delete this project once the backport is done.
 //
-// Round 2: CompleteProfileDescriptorClass (Profile's ctor parameter, i.e. 4.1's ProfileDescriptor)
-// has many more fields than the 4.1 mod set, and several of those fields are themselves
-// obfuscated DTOs whose own shape we still need (EFTInventoryClass, ProfileInfoClass, the two
-// nested types inside ProfileHealthClass). Recurses a few levels into "interesting" field types
-// instead of hardcoding names, so this round should surface everything in one pass.
+// Round 3: round 2's deep recursive dump got most of what we needed but appears to have hit a
+// StackOverflowException partway through (dump.txt cut off mid-type, with the rest of the file -
+// including the CorpseRagdoll search - missing entirely; StackOverflowException can't be caught
+// and skips the StreamWriter's Dispose/Flush). Narrowed to exactly the 4 remaining unknowns, each
+// its own small/safe lookup, flushing after every section so a crash anywhere only loses that one
+// section instead of everything after it.
 class Program
 {
     static void Main(string[] args)
@@ -63,46 +64,18 @@ class Program
         }
 
         using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
-        var visited = new HashSet<Type>();
+        const BindingFlags instanceFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        const BindingFlags staticFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly;
 
-        Type profileType = allTypes.FirstOrDefault(t => t.FullName == "EFT.Profile")
-            ?? allTypes.FirstOrDefault(t => t.Name == "Profile" && t.Namespace != null && t.Namespace.StartsWith("EFT"));
-
-        if (profileType == null)
-        {
-            w.WriteLine("Could not find a type named 'Profile' under an EFT.* namespace.");
-        }
-        else
-        {
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-
-            w.WriteLine("=== " + profileType.FullName + " constructors, recursed 3 levels into descriptor-shaped fields ===");
-            foreach (var ctor in SafeGet(() => profileType.GetConstructors(flags)))
-            {
-                var pars = SafeGet(() => ctor.GetParameters());
-                w.WriteLine("  ctor(" + string.Join(", ", pars.Select(p => SafeTypeName(p.ParameterType) + " " + p.Name)) + ")");
-
-                foreach (var p in pars)
-                {
-                    DumpTypeDeep(w, p.ParameterType, "    ", depth: 3, visited);
-                }
-            }
-
-            w.WriteLine();
-            w.WriteLine("=== " + profileType.FullName + " nested types (top level only) ===");
-            foreach (var nt in SafeGet(() => profileType.GetNestedTypes(flags)))
-            {
-                w.WriteLine("  nested: " + nt.FullName);
-            }
-        }
-
-        w.WriteLine();
+        // 1) CorpseRagdoll search + PlayerBody chain first - cheapest, and round 2 never reached
+        // this because it ran after the (crashing) deep recursion.
         w.WriteLine("=== searching all loaded types for CorpseRagdoll's shape (fields _owner + _onRigidbodyStopped, or name containing 'Ragdoll') ===");
+        w.Flush();
         foreach (var t in allTypes)
         {
             try
             {
-                var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                var fields = t.GetFields(instanceFlags);
                 bool hasOwner = fields.Any(f => f.Name == "_owner");
                 bool hasStoppedEvent = fields.Any(f => f.Name.IndexOf("onRigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0);
                 bool nameMatch = t.Name.IndexOf("Ragdoll", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -110,13 +83,17 @@ class Program
                 if ((hasOwner && hasStoppedEvent) || nameMatch)
                 {
                     w.WriteLine("  candidate: " + t.FullName + " (hasOwner=" + hasOwner + ", hasStoppedEvent=" + hasStoppedEvent + ", nameMatch=" + nameMatch + ")");
-                    DumpTypeDeep(w, t, "    ", depth: 0, visited: new HashSet<Type>());
-
-                    var candidateMethods = SafeGet(() => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly));
-                    foreach (var m in candidateMethods.Where(m => m.Name == "Start" || m.Name.IndexOf("RigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0))
+                    foreach (var f in fields)
                     {
-                        w.WriteLine("    method: " + m);
+                        w.WriteLine("    field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
                     }
+
+                    var methods = SafeGet(() => t.GetMethods(instanceFlags));
+                    foreach (var m in methods.Where(m => m.Name == "Start" || m.Name.IndexOf("RigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        w.WriteLine("    method: " + m + (m.IsPublic ? " [public]" : " [non-public]"));
+                    }
+                    w.Flush();
                 }
             }
             catch
@@ -125,107 +102,74 @@ class Program
             }
         }
 
-        // PlayerBody is the strongest guess for RagdollClass's "_owner" equivalent (RagdollClass
-        // has a PlayerBody_0 field, and _owner.TryGetComponent<LocalPlayer>(...) only compiles if
-        // _owner's type inherits Component.TryGetComponent). Print PlayerBody's base type chain to
-        // confirm it actually is a Component/MonoBehaviour.
+        // 2) PlayerBody's base type chain - confirms it inherits Component.TryGetComponent, which
+        // the CorpseRagdoll._owner.TryGetComponent<LocalPlayer>(...) call requires.
+        w.WriteLine();
+        w.WriteLine("=== EFT.PlayerBody base type chain ===");
         Type playerBodyType = allTypes.FirstOrDefault(t => t.FullName == "EFT.PlayerBody");
-        if (playerBodyType != null)
+        if (playerBodyType == null)
         {
-            w.WriteLine();
-            w.WriteLine("=== EFT.PlayerBody base type chain (confirms whether it has TryGetComponent) ===");
+            w.WriteLine("  not found");
+        }
+        else
+        {
             for (Type bt = playerBodyType; bt != null; bt = bt.BaseType)
             {
                 w.WriteLine("  " + bt.FullName);
             }
         }
-
         w.Flush();
+
+        // 3) EFT.MongoID's static members - need the replacement for MongoID.Generate(bool).
+        w.WriteLine();
+        w.WriteLine("=== EFT.MongoID static members ===");
+        Type mongoIdType = allTypes.FirstOrDefault(t => t.FullName == "EFT.MongoID");
+        if (mongoIdType == null)
+        {
+            w.WriteLine("  not found");
+        }
+        else
+        {
+            foreach (var m in SafeGet(() => mongoIdType.GetMethods(staticFlags).Where(m => !m.IsSpecialName).ToArray()))
+            {
+                w.WriteLine("  method: " + m + (m.IsPublic ? " [public]" : " [non-public]"));
+            }
+            foreach (var f in SafeGet(() => mongoIdType.GetFields(staticFlags)))
+            {
+                w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
+            }
+        }
+        w.Flush();
+
+        // 4) InventoryDescriptorClass's own direct members only - no recursion at all, this is
+        // exactly the type that likely triggered round 2's crash once the recursion reached it
+        // (Item/Slot graphs tend to be huge and cross-referential).
+        w.WriteLine();
+        w.WriteLine("=== InventoryDescriptorClass direct members (no recursion) ===");
+        Type inventoryDescriptorType = allTypes.FirstOrDefault(t => t.FullName == "InventoryDescriptorClass" || t.Name == "InventoryDescriptorClass");
+        if (inventoryDescriptorType == null)
+        {
+            w.WriteLine("  not found");
+        }
+        else
+        {
+            foreach (var ctor in SafeGet(() => inventoryDescriptorType.GetConstructors(instanceFlags)))
+            {
+                var pars = SafeGet(() => ctor.GetParameters());
+                w.WriteLine("  ctor(" + string.Join(", ", pars.Select(p => SafeTypeName(p.ParameterType) + " " + p.Name)) + ")" + (ctor.IsPublic ? " [public]" : " [non-public]"));
+            }
+            foreach (var f in SafeGet(() => inventoryDescriptorType.GetFields(instanceFlags)))
+            {
+                w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
+            }
+            foreach (var p in SafeGet(() => inventoryDescriptorType.GetProperties(instanceFlags)))
+            {
+                w.WriteLine("  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
+            }
+        }
+        w.Flush();
+
         Console.WriteLine("Wrote dump.txt");
-    }
-
-    // Recursively dumps ctors/fields/props of a type, following non-system field types (unwrapping
-    // Dictionary<,>'s value type, List<>'s element type, Nullable<>'s underlying type, and arrays)
-    // up to `depth` levels, so obfuscated DTO field types (EFTInventoryClass, ProfileInfoClass,
-    // etc.) surface without needing their names guessed ahead of time. `visited` prevents infinite
-    // recursion on cyclic references (e.g. Profile+Class1413.profile_0 : Profile).
-    static void DumpTypeDeep(StreamWriter w, Type t, string indent, int depth, HashSet<Type> visited)
-    {
-        if (t == null || t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(object) || t == typeof(decimal))
-        {
-            return;
-        }
-
-        if (!visited.Add(t))
-        {
-            w.WriteLine(indent + "type: " + t.FullName + " (already dumped above)");
-            return;
-        }
-
-        w.WriteLine(indent + "type: " + t.FullName);
-
-        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
-
-        foreach (var ctor in SafeGet(() => t.GetConstructors(flags)))
-        {
-            var pars = SafeGet(() => ctor.GetParameters());
-            w.WriteLine(indent + "  ctor(" + string.Join(", ", pars.Select(p => SafeTypeName(p.ParameterType) + " " + p.Name)) + ")" + (ctor.IsPublic ? " [public]" : " [non-public]"));
-        }
-
-        var fields = SafeGet(() => t.GetFields(flags));
-        foreach (var f in fields)
-        {
-            w.WriteLine(indent + "  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
-        }
-
-        var props = SafeGet(() => t.GetProperties(flags));
-        foreach (var p in props)
-        {
-            w.WriteLine(indent + "  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
-        }
-
-        if (depth <= 0)
-        {
-            return;
-        }
-
-        var toRecurse = new List<Type>();
-        foreach (var f in fields)
-        {
-            Type ft = f.FieldType;
-
-            if (ft.IsArray)
-            {
-                ft = ft.GetElementType();
-            }
-            else if (ft.IsGenericType)
-            {
-                Type genDef = ft.GetGenericTypeDefinition();
-                Type[] genArgs = ft.GetGenericArguments();
-                if (genDef == typeof(Dictionary<,>)) ft = genArgs[1];
-                else if (genDef == typeof(List<>)) ft = genArgs[0];
-                else if (genDef == typeof(Nullable<>)) ft = genArgs[0];
-                else continue;
-            }
-
-            if (ft == null || ft.IsPrimitive || ft.IsEnum || ft == typeof(string))
-            {
-                continue;
-            }
-
-            if (ft.Namespace != null &&
-                (ft.Namespace.StartsWith("System") || ft.Namespace.StartsWith("Unity") || ft.Namespace.StartsWith("RootMotion")))
-            {
-                continue;
-            }
-
-            toRecurse.Add(ft);
-        }
-
-        foreach (var ft in toRecurse.Distinct())
-        {
-            DumpTypeDeep(w, ft, indent + "  ", depth - 1, visited);
-        }
     }
 
     static T[] SafeGet<T>(Func<T[]> get)
