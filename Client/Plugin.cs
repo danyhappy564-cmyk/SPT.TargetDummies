@@ -1423,7 +1423,9 @@ namespace SevenBoldPencil.TargetDummies
 
 			yield return new WaitForSeconds(SpawnInterval.Value);
 
-			SpawnBot(mannequinData);
+			// Deliberately not awaited - a coroutine cannot await, and SpawnBot already handles its
+			// own failures. The discard is what says so to the compiler, instead of warning CS4014.
+			_ = SpawnBot(mannequinData);
 		}
     }
 

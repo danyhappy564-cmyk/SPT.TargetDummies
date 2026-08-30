@@ -20,6 +20,8 @@
     <Reference Include="UnityEngine" />
     <Reference Include="UnityEngine.AssetBundleModule" />
     <Reference Include="UnityEngine.CoreModule" />
+    <!-- GUI/GUILayout, for drawing the Refresh Mannequins button in the F12 config menu. -->
+    <Reference Include="UnityEngine.IMGUIModule" />
     <Reference Include="UnityEngine.ImageConversionModule" />
     <Reference Include="UnityEngine.InputLegacyModule" />
     <Reference Include="UnityEngine.PhysicsModule" />
