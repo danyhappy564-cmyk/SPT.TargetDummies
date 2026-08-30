@@ -111,6 +111,7 @@ namespace SevenBoldPencil.TargetDummies
 		public ConfigEntry<bool> SpawnUnarmored;
 		public ConfigEntry<bool> ForceWeaponLightsOff;
 		public ConfigEntry<float> SpawnInterval;
+		public ConfigEntry<float> CorpseLinger;
 		public ConfigEntry<string> FallbackMeleeTemplateId;
 
 		public ConfigEntry<KeyboardShortcut> RefreshHotkey;
@@ -162,6 +163,12 @@ namespace SevenBoldPencil.TargetDummies
 				"Seconds to wait between spawning one mannequin and the next, and before a killed mannequin respawns. "
 				+ "Lower is faster but spawns more work into a single frame.",
 				new AcceptableValueRange<float>(0.1f, 5f), new ConfigurationManagerAttributes { Order = 6 }));
+
+			CorpseLinger = Config.Bind<float>("Mannequin Settings", "Corpse Linger", 2f, new ConfigDescription(
+				"Seconds a body stays before it is removed and respawned. HollywoodFX attaches its blood and "
+				+ "gore to the ragdoll when the ragdoll starts, so removing the body too early cuts the effect "
+				+ "off before it plays. Raise this if kills stop producing blood.",
+				new AcceptableValueRange<float>(0.5f, 10f), new ConfigurationManagerAttributes { Order = 8 }));
 
 			FallbackMeleeTemplateId = Config.Bind<string>("Mannequin Settings", "Fallback Melee Template Id", "54491bb74bdc2d09088b4567", new ConfigDescription(
 				"Item template id given to an unarmored mannequin when you are not carrying a melee weapon yourself. "
@@ -1576,7 +1583,13 @@ namespace SevenBoldPencil.TargetDummies
 				yield break;
 			}
 
-			yield return new WaitForSeconds(SpawnInterval.Value);
+			// PORTING NOTE (SPT 4.0.13): this wait is deliberately NOT the spawn interval. It used to
+			// be, and that is what stopped kills producing blood: HollywoodFX attaches its gore to
+			// the ragdoll from a prefix on RagdollClass.Start (confirmed by dumping its assembly -
+			// RagdollStartPrefixPatch), so disposing the body promptly cut the effect off before it
+			// could play. Lowering the spawn interval to speed spawns up therefore silently killed
+			// the death effects. The corpse now has its own, separately bounded timing.
+			yield return new WaitForSeconds(CorpseLinger.Value);
 
 			bot.Dispose();
 			AssetPoolObject.ReturnToPool(bot.gameObject, true);
