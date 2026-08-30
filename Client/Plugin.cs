@@ -158,12 +158,19 @@ namespace SevenBoldPencil.TargetDummies
 			TryEnable(new Patch_GameWorld_DestroyAllLoot(), nameof(Patch_GameWorld_DestroyAllLoot));
 			TryEnable(new Patch_CorpseRagdoll_Start(), nameof(Patch_CorpseRagdoll_Start));
 			TryEnable(new Patch_HideoutAreaTrigger_OnTriggerExit(), nameof(Patch_HideoutAreaTrigger_OnTriggerExit));
+
+			// Ported from spt-hideout-shootout's own HollywoodFX hideout-effects compat fix -
+			// TryEnable itself is defensive (reflection-based, no-ops cleanly if HollywoodFX isn't
+			// installed), so it doesn't need the same try/catch wrapper as the patches above.
+			Patch_HollywoodFX_ForceEffectsInHideout.TryEnable();
         }
 
 		public async Task SpawnBot(MannequinData data)
 		{
 			try
 			{
+
+			Patch_HollywoodFX_ForceEffectsInHideout.TryWireShotDelegateOnce();
 
     		if (!TarkovApplication.Exist(out var tarkovApplication))
             {
@@ -373,9 +380,17 @@ namespace SevenBoldPencil.TargetDummies
 				return name;
 			}
 
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - voice-line bundles
+			// (assets/content/audio/phrases/*.bundle) never resolve within any timeout tried (15s,
+			// 90s, 110s - all the same), even the player's own live voice id, unlike character mesh/
+			// gear bundles which normally resolve quickly. LocalPlayer.Create tolerates a missing
+			// voice bundle fine (confirmed: mannequins spawn and function correctly without one
+			// preloaded), so waiting on it every single spawn was pure wasted time (most of the
+			// slowness reported between mannequins). Excluded from the preload wait entirely.
 			var bundleNames = resourceKeys
 				.Select(NormalizeBundleName)
 				.Where(name => !string.IsNullOrEmpty(name))
+				.Where(name => name.IndexOf("/audio/", StringComparison.OrdinalIgnoreCase) < 0)
 				.Distinct()
 				.ToArray();
 
