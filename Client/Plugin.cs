@@ -492,13 +492,21 @@ namespace SevenBoldPencil.TargetDummies
 				Logger.LogWarning($"Could not dispose a mannequin: {ex.GetType().Name}: {ex.Message}");
 			}
 
+			// PORTING NOTE (SPT 4.0.13): destroy the body rather than returning it to the pool, and
+			// this is load-bearing for the death effects. An A/B in-game settled it: in the build
+			// where Dispose() happened to throw - so ReturnToPool never ran - kills produced blood;
+			// the moment that throw was fixed and pooling actually started working, blood stopped.
+			// A pooled body is handed straight back out for the next mannequin, carrying
+			// HollywoodFX's spent gore state with it (its gore components detach on disable), so
+			// every reused body is already poisoned. A fresh object per spawn is what makes the
+			// effects play, and unlike the accidental version it leaves nothing floating behind.
 			try
 			{
-				AssetPoolObject.ReturnToPool(bot.gameObject, true);
+				UnityEngine.Object.Destroy(bot.gameObject);
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning($"Could not return a mannequin to the pool: {ex.GetType().Name}: {ex.Message}");
+				Logger.LogWarning($"Could not destroy a mannequin's body: {ex.GetType().Name}: {ex.Message}");
 			}
 
 			DestroyCorpse(profileId, position);
