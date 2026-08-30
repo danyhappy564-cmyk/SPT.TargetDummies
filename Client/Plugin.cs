@@ -90,8 +90,7 @@ namespace SevenBoldPencil.TargetDummies
 
 	public readonly record struct MannequinData
 	(
-		Vector3 Position,
-		ConfigEntry<MannequinType> Type
+		Vector3 Position
 	);
 
     [BepInPlugin("7Bpencil.TargetDummies", "7Bpencil.TargetDummies", "0.2.1")]
@@ -99,14 +98,6 @@ namespace SevenBoldPencil.TargetDummies
     {
         public static Plugin Instance;
 		public ManualLogSource LoggerInstance;
-
-		public ConfigEntry<MannequinType> CloseLeftMannequinType;
-		public ConfigEntry<MannequinType> CloseMiddleMannequinType;
-		public ConfigEntry<MannequinType> CloseRightMannequinType;
-
-		public ConfigEntry<MannequinType> FarLeftMannequinType;
-		public ConfigEntry<MannequinType> FarMiddleMannequinType;
-		public ConfigEntry<MannequinType> FarRightMannequinType;
 
 		public ConfigEntry<float> Mannequin_Health_Head;
 		public ConfigEntry<float> Mannequin_Health_Chest;
@@ -120,14 +111,6 @@ namespace SevenBoldPencil.TargetDummies
         {
             Instance = this;
 			LoggerInstance = Logger;
-
-			CloseLeftMannequinType = Config.Bind<MannequinType>("Close", "Left Mannequin Type", MannequinType.Scav, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 3 }));
-			CloseMiddleMannequinType = Config.Bind<MannequinType>("Close", "Middle Mannequin Type", MannequinType.Scav, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 2 }));
-			CloseRightMannequinType = Config.Bind<MannequinType>("Close", "Right Mannequin Type", MannequinType.Scav, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 1 }));
-
-			FarLeftMannequinType = Config.Bind<MannequinType>("Far", "Left Mannequin Type", MannequinType.Scav, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 3 }));
-			FarMiddleMannequinType = Config.Bind<MannequinType>("Far", "Middle Mannequin Type", MannequinType.Scav, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 2 }));
-			FarRightMannequinType = Config.Bind<MannequinType>("Far", "Right Mannequin Type", MannequinType.Scav, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 1 }));
 
 			Mannequin_Health_Head = Config.Bind<float>("Mannequin Settings", "Health Head", 35, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 5 }));
 			Mannequin_Health_Chest = Config.Bind<float>("Mannequin Settings", "Health Chest", 85, new ConfigDescription("", null, new ConfigurationManagerAttributes { Order = 4 }));
@@ -191,7 +174,7 @@ namespace SevenBoldPencil.TargetDummies
 			var hideoutGameWorld = hideoutGame.GameWorld_0;
 			var localPlayerPosition = new Vector3(-2.5263f, 0f, 9.3481f);
 
-			var botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile_0, data.Type.Value);
+			var botPlayerProfile = GenerateProfileFromPlayerLoadout(hideoutGame.Profile_0);
 
 			// PORTING NOTE (SPT 4.0.13): a prior version of this port stripped EBodyModelPart.Hands
 			// from the profile's Customization here, copying a fix from spt-hideout-shootout's own
@@ -304,13 +287,13 @@ namespace SevenBoldPencil.TargetDummies
 				}
 				catch (Exception ex) when (attempt == 1)
 				{
-					Logger.LogWarning($"LocalPlayer.Create failed for {data.Type.Value} ({ex.GetType().Name}: {ex.Message}); re-rolling the profile and retrying once.");
+					Logger.LogWarning($"LocalPlayer.Create failed ({ex.GetType().Name}: {ex.Message}); rebuilding the profile and retrying once.");
 
 					// Clean up whatever the failed attempt left behind before trying again.
 					DestroyOrphanedPlayers(playersBeforeCreate);
 
 					botPlayerId = UnityEngine.Random.Range(100000, int.MaxValue);
-					botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile_0, data.Type.Value);
+					botPlayerProfile = GenerateProfileFromPlayerLoadout(hideoutGame.Profile_0);
 					await PreloadProfileBundlesAsync(botPlayerProfile);
 					playersBeforeCreate = new HashSet<LocalPlayer>(UnityEngine.Object.FindObjectsOfType<LocalPlayer>());
 				}
@@ -372,7 +355,7 @@ namespace SevenBoldPencil.TargetDummies
 				TrySetEmptyHands(botPlayer);
 			}
 
-			Logger.LogWarning($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position} (type={data.Type.Value}).");
+			Logger.LogWarning($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position}.");
 
 			}
 			catch (Exception e)
@@ -653,7 +636,7 @@ namespace SevenBoldPencil.TargetDummies
 					};
 
 					load.Operation = bundlesManager.LoadBundleAsync(name, false);
-					StartCoroutine(DriveOperationCoroutine(load.Operation, load.Tcs));
+					load.Driver = StartCoroutine(DriveOperationCoroutine(load.Operation, load.Tcs));
 					pending.Add(load);
 				}
 				catch (Exception ex)
@@ -674,25 +657,41 @@ namespace SevenBoldPencil.TargetDummies
 				}
 			}
 
-			var stuck = pending.Where(p => !p.Tcs.Task.IsCompleted).Select(p => p.Name).ToArray();
-			var failed = pending.Where(p => p.Tcs.Task.IsCompleted && !OperationSucceeded(p.Operation)).Select(p => p.Name).ToArray();
-			int loaded = pending.Count - stuck.Length - failed.Length;
-
-			if (stuck.Length == 0 && failed.Length == 0)
+			// PORTING NOTE (SPT 4.0.13): stop the drivers that never settled. A coroutine blocked on
+			// an operation that never completes keeps pumping it every frame forever, and a fresh
+			// batch is started for every spawn AND every respawn - so they pile up and steadily eat
+			// the framerate for the rest of the session. Nothing is lost by stopping them: these are
+			// exactly the loads confirmed never to finish.
+			foreach (var stalled in pending.Where(p => !p.Tcs.Task.IsCompleted))
 			{
-				Logger.LogWarning($"{label} for profile {profileId}: all {pending.Count} loaded ({seen.Count - pending.Count} were already resident).");
+				if (stalled.Driver != null)
+				{
+					try { StopCoroutine(stalled.Driver); }
+					catch (Exception ex) { Logger.LogDebug($"StopCoroutine for '{stalled.Name}' threw: {ex.Message}"); }
+				}
+
+				stalled.Tcs.TrySetResult(false);
+			}
+
+			var notLoaded = pending.Where(p => !OperationSucceeded(p.Operation)).Select(p => p.Name).ToArray();
+			int loaded = pending.Count - notLoaded.Length;
+			int alreadyResident = seen.Count - pending.Count;
+
+			if (notLoaded.Length == 0)
+			{
+				Logger.LogWarning($"{label} for profile {profileId}: all {pending.Count} loaded ({alreadyResident} were already resident).");
 				return;
 			}
 
 			if (logEachFailure)
 			{
 				Logger.LogWarning(
-					$"{label} for profile {profileId}: {loaded}/{pending.Count} loaded. " +
-					$"Never settled: [{string.Join(", ", stuck)}]. Failed: [{string.Join(", ", failed)}]. Proceeding anyway.");
+					$"{label} for profile {profileId}: {loaded}/{pending.Count} loaded, {alreadyResident} already resident. " +
+					$"Not loaded: [{string.Join(", ", notLoaded)}]. Proceeding anyway.");
 			}
 			else
 			{
-				Logger.LogWarning($"{label} for profile {profileId}: {loaded}/{pending.Count} loaded ({stuck.Length} never settled, {failed.Length} failed). Proceeding anyway.");
+				Logger.LogWarning($"{label} for profile {profileId}: {loaded}/{pending.Count} loaded, {alreadyResident} already resident, {notLoaded.Length} not loaded. Proceeding anyway.");
 			}
 		}
 
@@ -747,6 +746,13 @@ namespace SevenBoldPencil.TargetDummies
 		private sealed class PendingBundleLoad
 		{
 			public string Name;
+
+			/// <summary>
+			/// The coroutine driving <see cref="Operation"/>. Kept so a load that never settles can
+			/// be stopped - otherwise it keeps pumping the operation every frame for the rest of the
+			/// session, and they accumulate with every spawn and respawn.
+			/// </summary>
+			public Coroutine Driver;
 
 			/// <summary>
 			/// The IOperation. Typed as object because LoadAssetAsync returns IOperation&lt;object&gt;
@@ -839,6 +845,82 @@ namespace SevenBoldPencil.TargetDummies
 					Instance.Logger.LogWarning($"Failed to restore DisableDevMaskCheckPatch: {ex.Message}");
 				}
 			}
+		}
+
+		/// <summary>
+		/// Builds a mannequin profile that is a copy of the player's own character - their
+		/// appearance and the gear they are currently carrying.
+		/// </summary>
+		/// <remarks>
+		/// PORTING NOTE (SPT 4.0.13): this replaces the per-slot MannequinType options, and the reason
+		/// is that no other source of appearance works reliably in the hideout on this client.
+		///
+		/// Real bot profiles (Scav, Tagilla, Raider, ...) need character and gear bundles that are not
+		/// resident, and those cannot be loaded from here: a bundle's dependency list includes the
+		/// global "cubemaps" and "shaders" bundles, which the hideout already holds under a loader
+		/// BundlesManagerClass has no record of, so re-requesting them gets Unity's "another
+		/// AssetBundle with the same files is already loaded", they never register, and the dependent
+		/// load waits on them forever. Every entry point was tried - LoadBundlesAsync batched and
+		/// per-bundle, LoadAssetAsync per ResourceKey, BundlesManagerClass.LoadBundleAsync with
+		/// dependency skipping - and all of them dead-end there. PoolManagerClass.LoadBundlesAndCreatePools,
+		/// which the SPT 4.1 version used, is uncallable because its signature contains GDelegate62,
+		/// a delegate type the CLR refuses to load.
+		///
+		/// The decorative Equipment Presets Stand mannequin skin loads fine, but it is a display prop
+		/// with no ballistic material tagging, so shots produced no flinch and no blood.
+		///
+		/// The player's own character has neither problem: its bundles are resident by definition, and
+		/// it is a real combat model with correct hit materials. It also makes the weapon actually go
+		/// into the mannequin's hands, which stops the MouseLook NullReferenceException that a bot with
+		/// no hands controller threw every single frame - 10,827 of them in one session, which is what
+		/// was costing the framerate.
+		/// </remarks>
+		public Profile GenerateProfileFromPlayerLoadout(Profile playerProfile)
+		{
+			var profileDescriptor = GenerateMannequinProfile();
+
+			// Take the player's whole appearance - head, body, hands, feet, voice. Every one of these
+			// bundles is guaranteed loadable because the player is standing in the hideout wearing them.
+			foreach (var part in profileDescriptor.Customization.Keys.ToArray())
+			{
+				if (playerProfile.Customization.TryGetValue(part, out var playerValue))
+				{
+					profileDescriptor.Customization[part] = playerValue;
+				}
+			}
+
+			var profile = new Profile(profileDescriptor);
+
+			var profileSlots = profile.Inventory?.Equipment?.Slots;
+			var playerSlots = playerProfile.Inventory?.Equipment?.Slots;
+			if (profileSlots == null || playerSlots == null)
+			{
+				return profile;
+			}
+
+			// Clone whatever the player is actually carrying. Bounded by both arrays: the two profiles
+			// are not guaranteed to declare the same number of equipment slots, and indexing past the
+			// end would throw ArgumentOutOfRangeException.
+			int slotCount = Math.Min(profileSlots.Length, playerSlots.Length);
+			for (var i = 0; i < slotCount; i++)
+			{
+				var originalItem = playerSlots[i].ContainedItem;
+				if (originalItem == null)
+				{
+					continue;
+				}
+
+				try
+				{
+					profileSlots[i].ChangeContainedItemDirectly(originalItem.CloneItem());
+				}
+				catch (Exception ex)
+				{
+					Logger.LogWarning($"Could not clone the player's item in equipment slot {i} onto the mannequin: {ex.Message}");
+				}
+			}
+
+			return profile;
 		}
 
 		public async Task<Profile> GenerateProfile(ISession session, Profile playerProfile, MannequinType mannequinType)
@@ -1199,13 +1281,13 @@ namespace SevenBoldPencil.TargetDummies
 		{
 			yield return new WaitForSeconds(1f);
 
-			var closeLeft = new MannequinData(new(-4f, 0.01f, 16.2f), CloseLeftMannequinType);
-			var closeMiddle = new MannequinData(new(-2.9f, 0.01f, 23.75f), CloseMiddleMannequinType);
-			var closeRight = new MannequinData(new(-1.65f, 0.01f, 30.22f), CloseRightMannequinType);
+			var closeLeft = new MannequinData(new(-4f, 0.01f, 16.2f));
+			var closeMiddle = new MannequinData(new(-2.9f, 0.01f, 23.75f));
+			var closeRight = new MannequinData(new(-1.65f, 0.01f, 30.22f));
 
-			var farLeft = new MannequinData(new(-4.95f, 0.01f, 57.48f), FarLeftMannequinType);
-			var farMiddle = new MannequinData(new(-2.75f, 0.01f, 57.47f), FarMiddleMannequinType);
-			var farRight = new MannequinData(new(-0.56f, 0.01f, 57.47f), FarRightMannequinType);
+			var farLeft = new MannequinData(new(-4.95f, 0.01f, 57.48f));
+			var farMiddle = new MannequinData(new(-2.75f, 0.01f, 57.47f));
+			var farRight = new MannequinData(new(-0.56f, 0.01f, 57.47f));
 
 			// PORTING NOTE (SPT 4.0.13): confirmed in-game - firing all 6 SpawnBot calls at once
 			// (as 4.1's original fire-and-forget code did) makes their bundle preloads compete for
