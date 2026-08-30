@@ -262,31 +262,58 @@ namespace SevenBoldPencil.TargetDummies
 			// objects first so the catch below can destroy whatever Create orphaned.
 			playersBeforeCreate = new HashSet<LocalPlayer>(UnityEngine.Object.FindObjectsOfType<LocalPlayer>());
 
-			LocalPlayer botPlayer;
-			using (SuppressDisableDevMaskCheckPatch())
+			// PORTING NOTE (SPT 4.0.13): some bot types - Raider was the one seen in-game, while Scav,
+			// Shturman and Tagilla all spawned fine - fail inside PlayerBody.Init with a
+			// NullReferenceException, from a piece of their randomly rolled loadout that cannot be
+			// resolved on this install (several boss weapon bundles genuinely 404 here). Because the
+			// loadout is re-rolled per profile request, asking the server for a fresh profile and
+			// trying once more is often enough. Create throws quickly in this case, so the retry
+			// costs little.
+			LocalPlayer botPlayer = null;
+			for (int attempt = 1; attempt <= 2; attempt++)
 			{
-				botPlayer = await LocalPlayer.Create(
-					hideoutGameWorld,
-					botPlayerId,
-					data.Position,
-					rotation,
-					"Player",
-					"",
-					EPointOfView.ThirdPerson,
-					botPlayerProfile,
-					true,
-					hideoutGame.UpdateQueue,
-					Player.EUpdateMode.Auto,
-					Player.EUpdateMode.Auto,
-					botControllerMode,
-					new Func<float>(() => 1f),
-					new Func<float>(() => 1f),
-					new GClass2265(),
-					GClass1856.Default,
-					null,
-					ELocalMode.TRAINING,
-					false,
-					true);
+				try
+				{
+					using (SuppressDisableDevMaskCheckPatch())
+					{
+						botPlayer = await LocalPlayer.Create(
+							hideoutGameWorld,
+							botPlayerId,
+							data.Position,
+							rotation,
+							"Player",
+							"",
+							EPointOfView.ThirdPerson,
+							botPlayerProfile,
+							true,
+							hideoutGame.UpdateQueue,
+							Player.EUpdateMode.Auto,
+							Player.EUpdateMode.Auto,
+							botControllerMode,
+							new Func<float>(() => 1f),
+							new Func<float>(() => 1f),
+							new GClass2265(),
+							GClass1856.Default,
+							null,
+							ELocalMode.TRAINING,
+							false,
+							true);
+					}
+
+					break;
+				}
+				catch (Exception ex) when (attempt == 1)
+				{
+					Logger.LogWarning($"LocalPlayer.Create failed for {data.Type.Value} ({ex.GetType().Name}: {ex.Message}); re-rolling the profile and retrying once.");
+
+					// Clean up whatever the failed attempt left behind before trying again.
+					DestroyOrphanedPlayers(playersBeforeCreate);
+
+					botPlayerId = UnityEngine.Random.Range(100000, int.MaxValue);
+					botPlayerProfile = await GenerateProfile(tarkovApplication.Session, hideoutGame.Profile_0, data.Type.Value);
+					await PreloadProfileBundlesAsync(botPlayerProfile);
+					playersBeforeCreate = new HashSet<LocalPlayer>(UnityEngine.Object.FindObjectsOfType<LocalPlayer>());
+				}
 			}
 
 			if (botPlayer == null)
@@ -334,7 +361,15 @@ namespace SevenBoldPencil.TargetDummies
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning($"Could not put a weapon in mannequin {botPlayerProfile.Id}'s hands ({ex.GetType().Name}: {ex.Message}); it will stand unarmed.");
+				Logger.LogWarning($"Could not put a weapon in mannequin {botPlayerProfile.Id}'s hands ({ex.GetType().Name}: {ex.Message}); giving it empty hands instead.");
+
+				// PORTING NOTE (SPT 4.0.13): a bot left with NO hands controller at all
+				// NullReferences every single frame in MovementContext -> Player.MouseLook ->
+				// Player.LateUpdate, which floods the log and costs framerate for as long as the
+				// mannequin exists. Establishing an empty-hands controller gives MouseLook the state
+				// it dereferences. Done by reflection because the callback parameter's exact type
+				// is not confirmed for this build and a wrong guess would break the whole build.
+				TrySetEmptyHands(botPlayer);
 			}
 
 			Logger.LogWarning($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position} (type={data.Type.Value}).");
@@ -344,6 +379,33 @@ namespace SevenBoldPencil.TargetDummies
 			{
 				Logger.LogError(e);
 				DestroyOrphanedPlayers(playersBeforeCreate);
+			}
+		}
+
+		/// <summary>
+		/// Gives a bot an empty-hands controller, so that MovementContext/MouseLook has the state it
+		/// dereferences every frame. Reflection-based: the callback parameter's exact type is not
+		/// confirmed for this obfuscated build, and a null callback is accepted either way.
+		/// </summary>
+		private void TrySetEmptyHands(LocalPlayer botPlayer)
+		{
+			try
+			{
+				var method = botPlayer.GetType()
+					.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+					.FirstOrDefault(m => m.Name == "SetEmptyHands" && m.GetParameters().Length == 1);
+
+				if (method == null)
+				{
+					Logger.LogWarning("LocalPlayer has no single-argument SetEmptyHands; the mannequin may log a MouseLook NullReferenceException every frame.");
+					return;
+				}
+
+				method.Invoke(botPlayer, new object[] { null });
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"SetEmptyHands failed: {ex.GetType().Name}: {ex.Message}");
 			}
 		}
 
@@ -486,10 +548,16 @@ namespace SevenBoldPencil.TargetDummies
 
 			Logger.LogWarning($"Preloading {bundleNames.Length} bundles for profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundles.Length} other={otherBundles.Length}.");
 
-			// Mesh bundles decide whether the character has a body at all, so they get the longer wait
-			// and per-bundle reporting. Gear is cosmetic here and may lag behind.
-			await LoadBundlesAsync(meshBundles, 15, "character mesh", profile.Id, logEachFailure: true);
-			await LoadBundlesAsync(otherBundles, 5, "gear", profile.Id, logEachFailure: false);
+			// PORTING NOTE (SPT 4.0.13): these waits used to be 15s and 5s, which is where the
+			// "spawning takes forever" complaint came from - 20s per mannequin, six of them. Both are
+			// now short on purpose. The character model comes from the player (see
+			// UsePlayerCharacterModel), so its bundles are already resident and need no wait at all;
+			// and the remaining entries - "cubemaps", "shaders", and the gear bundles - are exactly
+			// the ones confirmed to never settle no matter how long we wait. Anything that CAN load
+			// still does, because these operations keep running after the wait expires; the wait only
+			// controls how long the spawn blocks before proceeding.
+			await LoadBundlesAsync(meshBundles, 2, "character mesh", profile.Id, logEachFailure: true);
+			await LoadBundlesAsync(otherBundles, 2, "gear", profile.Id, logEachFailure: false);
 		}
 
 		/// <summary>
