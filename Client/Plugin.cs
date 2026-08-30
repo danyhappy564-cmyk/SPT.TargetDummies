@@ -587,19 +587,25 @@ namespace SevenBoldPencil.TargetDummies
 			};
 		}
 
-		// PORTING NOTE (SPT 4.0.13, UNCONFIRMED AT RUNTIME): InventoryDescriptor (4.1's simple
-		// _items[]/_equipmentId shape) doesn't exist here - Profile's Inventory field is
-		// EFTInventoryClass, a much larger class. Best-effort reconstruction from field shape alone
-		// (no source access): Gclass1390_0 (FlatItemsDataClass[]) looks like the renamed flat item
-		// list (FlatItemsDataClass has the same _id/_tpl fields _items' elements had, plus
-		// parentId/slotId left null for a parentless root item), and FastAccess
-		// (Dictionary<EBoundItem, MongoID>) looks like the lookup 4.1's single _equipmentId scalar
-		// was replaced by - EFTInventoryClass.Equipment/.Stash/etc. are each backed by one
-		// EBoundItem entry, and EBoundItem.Equipment is guessed to correspond to the Equipment
-		// property by name. This compiles but is NOT confirmed to actually make
-		// profile.Inventory.Equipment resolve to a working container - if the mannequin's gear
-		// doesn't render or SetSlotItem throws, this is the first place to re-check (dump
-		// EFTInventoryClass.Equipment's getter body, or EBoundItem's real enum member names).
+		// PORTING NOTE (SPT 4.0.13, confirmed via DumpTool IL dump of EFTInventoryClass's getters
+		// and their backing method_0): the earlier FastAccess/EBoundItem guess was wrong.
+		// EFTInventoryClass (4.1's InventoryDescriptor) doesn't look anything up by enum key -
+		// .Equipment/.Stash/.QuestRaidItems/.QuestStashItems/.SortingTable are each a plain field
+		// (InventoryDescriptorClass, InventoryDescriptorClass_1..4 respectively), and method_0
+		// (called by every one of those getters first) only (re)builds all five of those fields
+		// from a live game Inventory via EFTItemSerializerClass.SerializeItem - but ONLY when
+		// InventoryDescriptorClass (Equipment) is still null:
+		//   if (this.InventoryDescriptorClass != null) return;
+		//   ... rebuilds Equipment/QuestRaidItems/QuestStashItems/Stash/SortingTable ...
+		// So pre-setting InventoryDescriptorClass ourselves makes method_0 a no-op and our value
+		// sticks - no FastAccess/EBoundItem involvement needed at all.
+		// KNOWN GAP: this leaves Equipment.Slots empty. That's fine for the default
+		// MannequinType.Scav/boss/etc. path (GetBotProfile fetches a real profile with a real
+		// Inventory - GenerateDefaultInventory is never called for those). But
+		// MannequinType.Mannequin1/2/3 (GenerateProfileWithMannequinEquipment, below) indexes into
+		// profile.Inventory.Equipment.Slots by position to clone the player's real mannequin gear,
+		// and an empty Slots list will throw ArgumentOutOfRangeException there. All 6 config slots
+		// default to MannequinType.Scav, so this only matters if Mannequin1/2/3 is selected.
 		public static EFTInventoryClass GenerateDefaultInventory()
 		{
 		    var equipment = MongoID.Generate(true);
@@ -609,9 +615,11 @@ namespace SevenBoldPencil.TargetDummies
 				{
 					new() { _id = equipment, _tpl = "55d7217a4bdc2d86028b456d" },
 				},
-				FastAccess = new Dictionary<EBoundItem, MongoID>
+				InventoryDescriptorClass = new InventoryDescriptorClass
 				{
-					{ EBoundItem.Equipment, equipment },
+					Id = equipment,
+					TemplateId = "55d7217a4bdc2d86028b456d",
+					Slots = new List<GClass1915>(),
 				},
 			};
 		}
