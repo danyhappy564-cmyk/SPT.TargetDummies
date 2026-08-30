@@ -202,7 +202,11 @@ namespace SevenBoldPencil.TargetDummies
 			// category via RegisterPools for capacity, then actually load the bundles through
 			// IAssetsManager.LoadBundlesAsync(string[]), trying every known ResourceKey->string
 			// conversion in turn since which one "works" isn't documented.
-			await PreloadProfileBundlesAsync(botPlayerProfile);
+			if (!await PreloadProfileBundlesAsync(botPlayerProfile))
+			{
+				Logger.LogWarning($"Skipping mannequin spawn for profile {botPlayerProfile.Id}: bundle preload did not complete.");
+				return;
+			}
 
 			// PORTING NOTE (SPT 4.0.13): HideoutGame/BaseLocalGame<HideoutPlayerOwner> has no method
 			// matching NextPlayerId (confirmed via DumpTool - no Player/Id/World/Profile-named
@@ -309,8 +313,10 @@ namespace SevenBoldPencil.TargetDummies
 		/// Loads the mannequin's prefabs into the Raid asset pools before LocalPlayer.Create runs.
 		/// Ported from spt-hideout-shootout's proven 4.0.13 fix for the same
 		/// ObjectsFactory/PoolManagerClass gap - see the PORTING NOTE in SpawnBot above.
+		/// Returns whether every bundle is confirmed loaded - see the PORTING NOTE below on why
+		/// SpawnBot must not call LocalPlayer.Create when this returns false.
 		/// </summary>
-		private async Task PreloadProfileBundlesAsync(Profile profile)
+		private async Task<bool> PreloadProfileBundlesAsync(Profile profile)
 		{
 			if (Singleton<PoolManagerClass>.Instantiated)
 			{
@@ -333,14 +339,14 @@ namespace SevenBoldPencil.TargetDummies
 			if (assetsManager == null)
 			{
 				Logger.LogWarning("AssetsManagerSingletonClass.Manager is unavailable; mannequin bundles cannot be preloaded.");
-				return;
+				return false;
 			}
 
 			var resourceKeys = profile.GetAllPrefabPaths(true).Where(key => key != null).ToArray();
 			if (resourceKeys.Length == 0)
 			{
 				Logger.LogWarning($"Profile {profile.Id} reported no prefab resource keys to preload.");
-				return;
+				return true;
 			}
 
 			// PORTING NOTE (SPT 4.0.13): confirmed via DumpTool - IAssetsManager.LoadBundlesAsync
@@ -384,7 +390,7 @@ namespace SevenBoldPencil.TargetDummies
 			if (bundleNames.Length == 0)
 			{
 				Logger.LogWarning($"No usable bundle names were produced for mannequin profile {profile.Id}; proceeding anyway.");
-				return;
+				return true;
 			}
 
 			var operation = assetsManager.LoadBundlesAsync(bundleNames);
@@ -392,12 +398,19 @@ namespace SevenBoldPencil.TargetDummies
 			var tcs = new TaskCompletionSource<bool>();
 			StartCoroutine(DriveOperationCoroutine(operation, tcs));
 
-			// PORTING NOTE (SPT 4.0.13): confirmed in-game a single mannequin's full bundle set
-			// (gear + character mesh) can take upward of 30s outside a real raid's loading screen -
-			// 20s was cutting this off too early even with spawns serialized (no contention). 90s
-			// gives real headroom; LocalPlayer.Create below also retries if a bundle still wasn't
-			// ready by the time this returns.
-			const double timeoutSeconds = 90;
+			// PORTING NOTE (SPT 4.0.13): confirmed in-game - "proceeding anyway" after a timeout was
+			// actively harmful. It doesn't skip the missing bundle; it just guarantees
+			// LocalPlayer.Create throws part way through construction, which leaves a broken
+			// half-built character in the scene (visible, idle animation playing, but no working
+			// health/hit-reaction - confirmed via an in-game test: a mannequin spawned exactly this
+			// way took no damage and never bled). A single bot's full bundle set (gear + character
+			// mesh + voice lines) has been observed needing more than 90s outside a real raid's
+			// loading screen, so this waits up to 110s (just under SpawnInitialBots' own 120s
+			// per-mannequin abandon cap) for the load to genuinely finish, and returns false rather
+			// than ever proceeding on an incomplete load - SpawnBot below skips LocalPlayer.Create
+			// entirely when this returns false, so a failure here cleanly drops just this one
+			// mannequin instead of leaving a broken one behind.
+			const double timeoutSeconds = 110;
 			var waitStart = DateTime.UtcNow;
 			while (true)
 			{
@@ -409,15 +422,18 @@ namespace SevenBoldPencil.TargetDummies
 
 				if ((DateTime.UtcNow - waitStart).TotalSeconds >= timeoutSeconds)
 				{
-					Logger.LogWarning($"Bundle preload timed out for mannequin profile {profile.Id}; proceeding anyway.");
-					return;
+					Logger.LogWarning($"Bundle preload timed out for mannequin profile {profile.Id}; skipping this mannequin.");
+					return false;
 				}
 			}
 
 			if (!operation.Succeed)
 			{
-				Logger.LogWarning($"Bundle preload did not succeed for mannequin profile {profile.Id} (Failed={operation.Failed} Error={operation.Error}); proceeding anyway.");
+				Logger.LogWarning($"Bundle preload did not succeed for mannequin profile {profile.Id} (Failed={operation.Failed} Error={operation.Error}); skipping this mannequin.");
+				return false;
 			}
+
+			return true;
 		}
 
 		private static IEnumerator DriveOperationCoroutine(IOperation operation, TaskCompletionSource<bool> tcs)
