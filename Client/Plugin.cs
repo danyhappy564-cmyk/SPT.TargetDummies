@@ -185,18 +185,14 @@ namespace SevenBoldPencil.TargetDummies
 			// intended effect. TargetDummies also mostly spawns real WildSpawnType bot profiles
 			// fetched via session.LoadBots (not hand-built ones like hideout-shootout's scav
 			// target), which should carry a legitimately loadable Hands entry already. Removed;
-			// if hands still fail to load in-game, that will show as a bundle-load
-			// warning/timeout from PreloadProfileBundlesAsync below, not a hard crash.
+			// if hands still fail to load in-game, that shows as a warning rather than a crash.
 
 			// PORTING NOTE (SPT 4.0.13): ObjectsFactory.LoadBundlesAndCreatePools (4.1's name for
-			// this singleton/method pair) doesn't exist under that name here - PoolManagerClass is
-			// the obfuscated 4.0.13 name, and its equivalent LoadBundlesAndCreatePools has a
-			// malformed callback delegate type the CLR refuses to load from mod code. Same blocker
-			// already solved in spt-hideout-shootout's own 4.0.13 backport: register the Raid pool
-			// category via RegisterPools for capacity, then load the profile's resources through
-			// IAssetsManager.LoadAssetAsync(ResourceKey) - see PreloadProfileBundlesAsync for why
-			// that overload, and not the string-based LoadBundlesAsync, is the working path here.
-			await PreloadProfileBundlesAsync(botPlayerProfile);
+			// this singleton/method pair) doesn't exist under that name here, and PoolManagerClass's
+			// equivalent is uncallable because its signature contains GDelegate62, a delegate type
+			// the CLR refuses to load. Only the pool registration half is needed now - the bundles
+			// themselves are resident, because every mannequin is a copy of the player.
+			EnsureRaidPoolsRegistered();
 
 			// PORTING NOTE (SPT 4.0.13): HideoutGame/BaseLocalGame<HideoutPlayerOwner> has no method
 			// matching NextPlayerId (confirmed via DumpTool - no Player/Id/World/Profile-named
@@ -294,7 +290,7 @@ namespace SevenBoldPencil.TargetDummies
 
 					botPlayerId = UnityEngine.Random.Range(100000, int.MaxValue);
 					botPlayerProfile = GenerateProfileFromPlayerLoadout(hideoutGame.Profile_0);
-					await PreloadProfileBundlesAsync(botPlayerProfile);
+					EnsureRaidPoolsRegistered();
 					playersBeforeCreate = new HashSet<LocalPlayer>(UnityEngine.Object.FindObjectsOfType<LocalPlayer>());
 				}
 			}
@@ -430,348 +426,43 @@ namespace SevenBoldPencil.TargetDummies
 				Logger.LogWarning($"Could not clean up orphaned player objects: {ex.Message}");
 			}
 		}
-
 		/// <summary>
-		/// Loads the mannequin's prefabs into the Raid asset pools before LocalPlayer.Create runs.
-		/// Ported from spt-hideout-shootout's proven 4.0.13 fix for the same
-		/// ObjectsFactory/PoolManagerClass gap - see the PORTING NOTE in SpawnBot above. Best-effort:
-		/// see the PORTING NOTE below on why this always proceeds rather than ever blocking the spawn.
+		/// Makes sure the Raid pool category exists before LocalPlayer.Create runs, since that is
+		/// where it pops the player object from.
 		/// </summary>
-		private async Task PreloadProfileBundlesAsync(Profile profile)
+		/// <remarks>
+		/// PORTING NOTE (SPT 4.0.13): this used to also preload the profile's bundles, and that is
+		/// now deliberately gone. Once every mannequin became a copy of the player (see
+		/// GenerateProfileFromPlayerLoadout) every bundle it needs is resident by definition, and
+		/// the preload's own logs proved it had stopped doing anything: "gear: 0/170 loaded,
+		/// 2 already resident, 170 not loaded", on every single mannequin, while the mannequins
+		/// themselves rendered perfectly. BundlesManagerClass simply has no record of bundles the
+		/// hideout loaded through another path, so FindBundle reports them missing and every
+		/// re-request then fails.
+		///
+		/// What it did cost was the remaining spawn hitch: ~170 doomed LoadBundleAsync operations
+		/// per mannequin, each with a coroutine pumping it every frame until the wait expired, six
+		/// times over, plus 4 seconds of blocking per mannequin.
+		/// </remarks>
+		private void EnsureRaidPoolsRegistered()
 		{
-			if (Singleton<PoolManagerClass>.Instantiated)
-			{
-				var pools = Singleton<PoolManagerClass>.Instance;
-				if (!pools.IsPoolReady(PoolManagerClass.PoolsCategory.Raid))
-				{
-					pools.RegisterPools(
-						PoolManagerClass.PoolsCategory.Raid,
-						null,
-						ObjectsFactoryDataClass.Default,
-						PoolManagerClass.AssemblyType.Local);
-				}
-			}
-			else
+			if (!Singleton<PoolManagerClass>.Instantiated)
 			{
 				Logger.LogWarning("PoolManagerClass singleton is unavailable; the Raid pool category could not be registered.");
-			}
-
-			var assetsManager = AssetsManagerSingletonClass.Manager;
-			if (assetsManager == null)
-			{
-				Logger.LogWarning("AssetsManagerSingletonClass.Manager is unavailable; mannequin bundles cannot be preloaded.");
 				return;
 			}
 
-			var resourceKeys = profile.GetAllPrefabPaths(true).Where(key => key != null).ToArray();
-			if (resourceKeys.Length == 0)
+			var pools = Singleton<PoolManagerClass>.Instance;
+			if (!pools.IsPoolReady(PoolManagerClass.PoolsCategory.Raid))
 			{
-				Logger.LogWarning($"Profile {profile.Id} reported no prefab resource keys to preload.");
-				return;
-			}
-
-			// PORTING NOTE (SPT 4.0.13): the long-running mystery here was that bundle loads never
-			// settled - not Succeed, not Failed, just permanently pending. Confirmed via the game's own
-			// Player.log what actually happens. The very first line after this method's first log
-			// message is:
-			//
-			//   The AssetBundle '.../StreamingAssets/Windows/cubemaps' can't be loaded because another
-			//   AssetBundle with the same files is already loaded.
-			//   Error while getting Asset Bundle: ...
-			//
-			// 59 of those, all inside this mod's spawn windows and none before it ran. Loading a
-			// character bundle pulls in its dependencies (cubemaps, shaders, per-weapon texture
-			// client_assets, physicsmaterials), the hideout already has those resident, Unity refuses to
-			// load a second copy, and the operation dies on the dependency without ever completing - so
-			// the character bundle itself is never loaded and LocalPlayer.Create throws "<head> is not
-			// loaded".
-			//
-			// So the fix is not a different entry point or a longer wait, it is to stop asking for
-			// things that are already loaded. BundlesManagerClass exposes exactly what is needed:
-			// FindBundle (is it resident?), FindDependences (what does it pull in?) and
-			// LoadBundleAsync(name, logErrors). Load dependencies first, skipping any that are already
-			// resident, then the bundle itself.
-			//
-			// The string format was right all along, incidentally - SPT's own BundleManager logs these
-			// as "Loading locally assets/content/characters/character/prefabs/<name>.bundle", i.e.
-			// forward slashes with a .bundle suffix, which is what NormalizeBundleName builds.
-			string NormalizeBundleName(ResourceKey key)
-			{
-				string name;
-				try { name = key.ToAssetName(); }
-				catch { return null; }
-
-				if (string.IsNullOrEmpty(name))
-				{
-					return null;
-				}
-
-				name = name.Replace('\\', '/');
-				if (!name.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase))
-				{
-					name += ".bundle";
-				}
-
-				return name;
-			}
-
-			bool IsCharacterMeshBundle(string name) =>
-				name.IndexOf("/characters/character/", StringComparison.OrdinalIgnoreCase) >= 0
-				|| name.IndexOf("/content/hands/", StringComparison.OrdinalIgnoreCase) >= 0
-				|| name.IndexOf("/content/feet/", StringComparison.OrdinalIgnoreCase) >= 0;
-
-			var bundleNames = resourceKeys
-				.Select(NormalizeBundleName)
-				.Where(name => !string.IsNullOrEmpty(name))
-				.Distinct()
-				.ToArray();
-
-			var meshBundles = bundleNames.Where(IsCharacterMeshBundle).ToArray();
-			var otherBundles = bundleNames.Where(name => !IsCharacterMeshBundle(name)).ToArray();
-
-			Logger.LogWarning($"Preloading {bundleNames.Length} bundles for profile {profile.Id} ({resourceKeys.Length} resource keys); mesh={meshBundles.Length} other={otherBundles.Length}.");
-
-			// PORTING NOTE (SPT 4.0.13): these waits used to be 15s and 5s, which is where the
-			// "spawning takes forever" complaint came from - 20s per mannequin, six of them. Both are
-			// now short on purpose. The character model comes from the player (see
-			// UsePlayerCharacterModel), so its bundles are already resident and need no wait at all;
-			// and the remaining entries - "cubemaps", "shaders", and the gear bundles - are exactly
-			// the ones confirmed to never settle no matter how long we wait. Anything that CAN load
-			// still does, because these operations keep running after the wait expires; the wait only
-			// controls how long the spawn blocks before proceeding.
-			await LoadBundlesAsync(meshBundles, 2, "character mesh", profile.Id, logEachFailure: true);
-			await LoadBundlesAsync(otherBundles, 2, "gear", profile.Id, logEachFailure: false);
-		}
-
-		/// <summary>
-		/// Issues one <c>LoadAssetAsync(ResourceKey)</c> operation per key, all concurrently, and
-		/// waits up to <paramref name="timeoutSeconds"/> for them to settle. Loading by ResourceKey
-		/// rather than by hand-built bundle name is the point - see the porting note in
-		/// <see cref="PreloadProfileBundlesAsync"/>. Per-key operations also mean an unreachable
-		/// resource only ever stalls itself.
-		/// </summary>
-		private async Task LoadBundlesAsync(
-			string[] bundleNames,
-			double timeoutSeconds,
-			string label,
-			string profileId,
-			bool logEachFailure)
-		{
-			if (bundleNames.Length == 0)
-			{
-				return;
-			}
-
-			var bundlesManager = TryGetBundlesManager();
-			if (bundlesManager == null)
-			{
-				Logger.LogWarning($"BundlesManager is unavailable; {label} bundles for profile {profileId} cannot be preloaded.");
-				return;
-			}
-
-			// A bundle's dependencies have to be resident before it will load, but asking for one that
-			// is ALREADY resident is what was killing these operations - so build the full set
-			// (dependencies first, then the bundle) and drop everything already loaded.
-			var wanted = new List<string>();
-			var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-			void Want(string name)
-			{
-				if (string.IsNullOrEmpty(name) || !seen.Add(name))
-				{
-					return;
-				}
-
-				try
-				{
-					if (bundlesManager.FindBundle(name) != null)
-					{
-						return; // already resident - requesting it again is the error we are avoiding
-					}
-				}
-				catch (Exception ex)
-				{
-					Logger.LogDebug($"FindBundle('{name}') threw: {ex.Message}");
-				}
-
-				wanted.Add(name);
-			}
-
-			foreach (var name in bundleNames)
-			{
-				try
-				{
-					var dependencies = bundlesManager.FindDependences(name);
-					if (dependencies != null)
-					{
-						foreach (var dependency in dependencies)
-						{
-							Want(dependency);
-						}
-					}
-				}
-				catch (Exception ex)
-				{
-					Logger.LogDebug($"FindDependences('{name}') threw: {ex.Message}");
-				}
-
-				Want(name);
-			}
-
-			if (wanted.Count == 0)
-			{
-				Logger.LogWarning($"{label} for profile {profileId}: all {bundleNames.Length} already resident, nothing to load.");
-				return;
-			}
-
-			var pending = new List<PendingBundleLoad>(wanted.Count);
-			foreach (var name in wanted)
-			{
-				try
-				{
-					var load = new PendingBundleLoad
-					{
-						Name = name,
-						Tcs = new TaskCompletionSource<bool>(),
-					};
-
-					load.Operation = bundlesManager.LoadBundleAsync(name, false);
-					load.Driver = StartCoroutine(DriveOperationCoroutine(load.Operation, load.Tcs));
-					pending.Add(load);
-				}
-				catch (Exception ex)
-				{
-					Logger.LogWarning($"Could not start a {label} load for '{name}': {ex.Message}");
-				}
-			}
-
-			var allSettled = Task.WhenAll(pending.Select(p => p.Tcs.Task));
-			var waitStart = DateTime.UtcNow;
-			while (!allSettled.IsCompleted)
-			{
-				await Task.WhenAny(allSettled, Task.Delay(TimeSpan.FromMilliseconds(250)));
-
-				if ((DateTime.UtcNow - waitStart).TotalSeconds >= timeoutSeconds)
-				{
-					break;
-				}
-			}
-
-			// PORTING NOTE (SPT 4.0.13): stop the drivers that never settled. A coroutine blocked on
-			// an operation that never completes keeps pumping it every frame forever, and a fresh
-			// batch is started for every spawn AND every respawn - so they pile up and steadily eat
-			// the framerate for the rest of the session. Nothing is lost by stopping them: these are
-			// exactly the loads confirmed never to finish.
-			foreach (var stalled in pending.Where(p => !p.Tcs.Task.IsCompleted))
-			{
-				if (stalled.Driver != null)
-				{
-					try { StopCoroutine(stalled.Driver); }
-					catch (Exception ex) { Logger.LogDebug($"StopCoroutine for '{stalled.Name}' threw: {ex.Message}"); }
-				}
-
-				stalled.Tcs.TrySetResult(false);
-			}
-
-			var notLoaded = pending.Where(p => !OperationSucceeded(p.Operation)).Select(p => p.Name).ToArray();
-			int loaded = pending.Count - notLoaded.Length;
-			int alreadyResident = seen.Count - pending.Count;
-
-			if (notLoaded.Length == 0)
-			{
-				Logger.LogWarning($"{label} for profile {profileId}: all {pending.Count} loaded ({alreadyResident} were already resident).");
-				return;
-			}
-
-			if (logEachFailure)
-			{
-				Logger.LogWarning(
-					$"{label} for profile {profileId}: {loaded}/{pending.Count} loaded, {alreadyResident} already resident. " +
-					$"Not loaded: [{string.Join(", ", notLoaded)}]. Proceeding anyway.");
-			}
-			else
-			{
-				Logger.LogWarning($"{label} for profile {profileId}: {loaded}/{pending.Count} loaded, {alreadyResident} already resident, {notLoaded.Length} not loaded. Proceeding anyway.");
+				pools.RegisterPools(
+					PoolManagerClass.PoolsCategory.Raid,
+					null,
+					ObjectsFactoryDataClass.Default,
+					PoolManagerClass.AssemblyType.Local);
 			}
 		}
 
-		/// <summary>
-		/// Resolves the BundlesManager behind the asset manager singleton. AssetsManagerSingletonClass
-		/// hands back the IAssetsManager interface, which does not expose it, so reach through the
-		/// concrete AssetsManagerClass.
-		/// </summary>
-		private static BundlesManagerClass TryGetBundlesManager()
-		{
-			try
-			{
-				return AssetsManagerSingletonClass.Manager is AssetsManagerClass concrete ? concrete.BundlesManager : null;
-			}
-			catch (Exception ex)
-			{
-				Plugin.Instance?.LoggerInstance?.LogWarning($"Could not resolve BundlesManager: {ex.Message}");
-				return null;
-			}
-		}
-
-		/// <summary>
-		/// Reads an operation's Succeed flag without the call site having to name its exact type.
-		/// LoadAssetAsync returns IOperation&lt;object&gt;, and whether that derives from the
-		/// non-generic IOperation is not confirmed for this obfuscated build, so fall back to
-		/// reflection rather than betting the whole build on it.
-		/// </summary>
-		private static bool OperationSucceeded(object operation)
-		{
-			if (operation == null)
-			{
-				return false;
-			}
-
-			if (operation is IOperation plain)
-			{
-				return plain.Succeed;
-			}
-
-			try
-			{
-				var property = operation.GetType().GetProperty("Succeed");
-				return property?.GetValue(operation) is bool succeeded && succeeded;
-			}
-			catch
-			{
-				return false;
-			}
-		}
-
-		/// <summary>One in-flight bundle load started by <see cref="LoadBundlesAsync"/>.</summary>
-		private sealed class PendingBundleLoad
-		{
-			public string Name;
-
-			/// <summary>
-			/// The coroutine driving <see cref="Operation"/>. Kept so a load that never settles can
-			/// be stopped - otherwise it keeps pumping the operation every frame for the rest of the
-			/// session, and they accumulate with every spawn and respawn.
-			/// </summary>
-			public Coroutine Driver;
-
-			/// <summary>
-			/// The IOperation. Typed as object because LoadAssetAsync returns IOperation&lt;object&gt;
-			/// and this build's generic/non-generic relationship isn't confirmed - read its result
-			/// through <see cref="OperationSucceeded"/>.
-			/// </summary>
-			public object Operation;
-
-			public TaskCompletionSource<bool> Tcs;
-		}
-
-		// Unity's coroutine runner nests any IEnumerator that gets yielded to it, so an operation
-		// passed as object still drives correctly - and taking object here keeps this usable for
-		// both the generic and non-generic IOperation.
-		private static IEnumerator DriveOperationCoroutine(object operation, TaskCompletionSource<bool> tcs)
-		{
-			yield return operation;
-			tcs.TrySetResult(OperationSucceeded(operation));
-		}
 
 		/// <summary>
 		/// Temporarily removes SPT's DisableDevMaskCheckPatch transpiler from LocalPlayer.Create's
