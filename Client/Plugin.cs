@@ -313,10 +313,30 @@ namespace SevenBoldPencil.TargetDummies
 				Logger.LogWarning("Could not resolve LocalPlayer.localPlayerCullingHandlerClass; mannequin body may stay invisible.");
 			}
 
-			// take weapon in hands
-			botPlayer.SetSlotItem(EquipmentSlot.FirstPrimaryWeapon, (_) => {});
-
+			// PORTING NOTE (SPT 4.0.13): register the mannequin BEFORE putting a weapon in its hands.
+			// The bot is fully constructed by this point, so it must be tracked even if the steps
+			// below fail - otherwise the catch in this method treats it as an orphan from a failed
+			// LocalPlayer.Create and destroys it, which is exactly what was happening: the spawn
+			// succeeded and then got cleaned up on its way out.
 			Mannequins[botPlayer] = data;
+
+			// take weapon in hands
+			//
+			// PORTING NOTE (SPT 4.0.13): this throws NullReferenceException inside
+			// Player.ItemHandsController.smethod_4 whenever the weapon's own bundles could not be
+			// loaded, which is common here - the hideout cannot load most gear bundles (see the
+			// remarks on UsePlayerCharacterModel). An armed mannequin is cosmetic; a mannequin that
+			// exists, takes hits and dies is the point. So a failure here is logged and swallowed
+			// rather than aborting a bot that is otherwise fine.
+			try
+			{
+				botPlayer.SetSlotItem(EquipmentSlot.FirstPrimaryWeapon, (_) => { });
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not put a weapon in mannequin {botPlayerProfile.Id}'s hands ({ex.GetType().Name}: {ex.Message}); it will stand unarmed.");
+			}
+
 			Logger.LogWarning($"Spawned mannequin for profile {botPlayerProfile.Id} at {data.Position} (type={data.Type.Value}).");
 
 			}
