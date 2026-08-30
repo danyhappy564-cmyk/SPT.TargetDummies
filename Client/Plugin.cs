@@ -152,8 +152,10 @@ namespace SevenBoldPencil.TargetDummies
                 return;
             }
 
+			// PORTING NOTE (SPT 4.0.13): the field is Task_0 (capital T) here, not task_0 - same
+			// Task<GStruct156<HideoutGame>> shape, confirmed via DumpTool.
 			var hideoutController = tarkovApplication.HideoutControllerAccess;
-			var hideoutGame = hideoutController.task_0.Result.Value;
+			var hideoutGame = hideoutController.Task_0.Result.Value;
 			var hideoutGameWorld = hideoutGame.GameWorld;
 			var localPlayerPosition = new Vector3(-2.5263f, 0f, 9.3481f);
 
@@ -616,8 +618,11 @@ namespace SevenBoldPencil.TargetDummies
 
 		public async Task<Profile> GetBotProfile(ISession session, WildSpawnType botType)
 		{
-			var botProfileRequest = new CountTypeBotWave(1, botType, BotDifficulty.normal);
-			var profilesRequest = new List<CountTypeBotWave>(1) { botProfileRequest };
+			// PORTING NOTE (SPT 4.0.13): CountTypeBotWave (4.1's name) is WaveInfoClass here -
+			// confirmed via SPT's own 4.0->4.1 class name mapping table, and its (count, roleType,
+			// difficulty) ctor shape is identical.
+			var botProfileRequest = new WaveInfoClass(1, botType, BotDifficulty.normal);
+			var profilesRequest = new List<WaveInfoClass>(1) { botProfileRequest };
 			var profiles = await session.LoadBots(profilesRequest);
 			var botPlayerProfile = profiles[0];
 			return botPlayerProfile;

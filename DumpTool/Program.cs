@@ -1,30 +1,46 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 using System.Text;
+using ICSharpCode.Decompiler;
+using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.Metadata;
 
 // One-off tool: dumps type/member info from the real installed EFT client assemblies so the
 // SPT 4.0.13 backport can be fixed against actual signatures instead of guesses. Not part of
 // the mod - delete this project once the backport is done.
 //
-// Round 3: round 2's deep recursive dump got most of what we needed but appears to have hit a
-// StackOverflowException partway through (dump.txt cut off mid-type, with the rest of the file -
-// including the CorpseRagdoll search - missing entirely; StackOverflowException can't be caught
-// and skips the StreamWriter's Dispose/Flush). Narrowed to exactly the 4 remaining unknowns, each
-// its own small/safe lookup, flushing after every section so a crash anywhere only loses that one
-// section instead of everything after it.
+// Round 5: rounds 1-4 resolved everything except EBoundItem - its enum members (ItemG, ItemV,
+// Item1..Item10) have no semantic naming, so there's no way to guess which one backs
+// EFTInventoryClass.Equipment from reflection alone. Decompiles that property's getter (and
+// .Stash's, for comparison) to read the actual IL/C#, isolated in a child process so a crash here
+// (same StackOverflowException risk noted in spt-hideout-shootout's own DumpTool for the game's
+// heavily obfuscated assemblies) only loses this one lookup.
 class Program
 {
+    static string ManagedDir;
+    static string BepInExCoreDir;
+
     static void Main(string[] args)
     {
-        string sptRoot = args.Length > 0 ? args[0] : @"E:\SPT 4.0.10";
-        string managedDir = Path.Combine(sptRoot, "EscapeFromTarkov_Data", "Managed");
-
-        if (!Directory.Exists(managedDir))
+        if (args.Length > 0 && args[0] == "--decompile-one")
         {
-            Console.WriteLine("Managed folder not found at: " + managedDir);
+            RunDecompileWorker(args);
+            return;
+        }
+
+        string sptRoot = args.Length > 0 ? args[0] : @"E:\SPT 4.0.10";
+        ManagedDir = Path.Combine(sptRoot, "EscapeFromTarkov_Data", "Managed");
+        BepInExCoreDir = Path.Combine(sptRoot, "BepInEx", "core");
+
+        if (!Directory.Exists(ManagedDir))
+        {
+            Console.WriteLine("Managed folder not found at: " + ManagedDir);
             Console.WriteLine("Pass the SPT root as the first argument if it's not " + sptRoot);
             return;
         }
@@ -32,23 +48,112 @@ class Program
         AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
         {
             string name = new AssemblyName(e.Name).Name;
-            string path = Path.Combine(managedDir, name + ".dll");
-            return File.Exists(path) ? Assembly.LoadFrom(path) : null;
+            string path = Path.Combine(ManagedDir, name + ".dll");
+            if (File.Exists(path)) return Assembly.LoadFrom(path);
+            if (Directory.Exists(BepInExCoreDir))
+            {
+                path = Path.Combine(BepInExCoreDir, name + ".dll");
+                if (File.Exists(path)) return Assembly.LoadFrom(path);
+            }
+            return null;
+        };
+
+        using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
+
+        w.WriteLine("=== decompiling EFTInventoryClass.Equipment / .Stash getters (child-process isolated) ===");
+        w.Flush();
+
+        string exePath = Process.GetCurrentProcess().MainModule.FileName;
+
+        void RunOne(string header, string methodName)
+        {
+            w.WriteLine("--- " + header + " ---");
+            w.Flush();
+
+            string outFile = Path.GetTempFileName();
+            try
+            {
+                var workerArgs = new List<string> { "--decompile-one", sptRoot, outFile, "EFTInventoryClass", methodName };
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    // ProcessStartInfo.ArgumentList isn't available on net48 - build the command
+                    // line by hand, quoting every argument (sptRoot alone contains a space).
+                    Arguments = string.Join(" ", workerArgs.Select(a => "\"" + a.Replace("\"", "\\\"") + "\"")),
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+
+                using (Process proc = Process.Start(psi))
+                {
+                    bool exited = proc.WaitForExit(30000);
+                    if (!exited)
+                    {
+                        try { proc.Kill(); } catch { }
+                        w.WriteLine("  <decompile worker timed out after 30s>");
+                    }
+                    else if (proc.ExitCode != 0)
+                    {
+                        w.WriteLine($"  <decompile worker crashed or exited with code {proc.ExitCode}>");
+                    }
+                    else if (File.Exists(outFile) && new FileInfo(outFile).Length > 0)
+                    {
+                        w.WriteLine(File.ReadAllText(outFile, Encoding.UTF8));
+                    }
+                    else
+                    {
+                        w.WriteLine("  <worker exited cleanly but produced no output>");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                w.WriteLine("  <failed to run decompile worker: " + ex.Message + ">");
+            }
+            finally
+            {
+                try { if (File.Exists(outFile)) File.Delete(outFile); } catch { }
+            }
+
+            w.WriteLine();
+            w.Flush();
+        }
+
+        RunOne("EFTInventoryClass.get_Equipment", "get_Equipment");
+        RunOne("EFTInventoryClass.get_Stash", "get_Stash");
+
+        Console.WriteLine("Wrote dump.txt");
+    }
+
+    // Runs in a separate child process (spawned by RunOne above), isolated so a
+    // StackOverflowException from decompiling this method only kills this child.
+    // args: --decompile-one <sptRoot> <outFile> <fullTypeName> <methodName>
+    static void RunDecompileWorker(string[] args)
+    {
+        string sptRoot = args[1];
+        string outFile = args[2];
+        string fullTypeName = args[3];
+        string methodName = args[4];
+
+        ManagedDir = Path.Combine(sptRoot, "EscapeFromTarkov_Data", "Managed");
+        BepInExCoreDir = Path.Combine(sptRoot, "BepInEx", "core");
+
+        AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
+        {
+            string name = new AssemblyName(e.Name).Name;
+            string path = Path.Combine(ManagedDir, name + ".dll");
+            if (File.Exists(path)) return Assembly.LoadFrom(path);
+            if (Directory.Exists(BepInExCoreDir))
+            {
+                path = Path.Combine(BepInExCoreDir, name + ".dll");
+                if (File.Exists(path)) return Assembly.LoadFrom(path);
+            }
+            return null;
         };
 
         var allTypes = new List<Type>();
-        foreach (string dllPath in Directory.GetFiles(managedDir, "*.dll"))
+        foreach (string dllPath in Directory.GetFiles(ManagedDir, "*.dll"))
         {
-            string fileName = Path.GetFileNameWithoutExtension(dllPath);
-            if (fileName.StartsWith("UnityEngine.", StringComparison.OrdinalIgnoreCase)
-                || fileName.StartsWith("Unity.", StringComparison.OrdinalIgnoreCase)
-                || fileName.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
-                || fileName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase)
-                || fileName is "mscorlib" or "netstandard" or "UnityEngine")
-            {
-                continue;
-            }
-
             try
             {
                 var asm = Assembly.LoadFrom(dllPath);
@@ -59,156 +164,59 @@ class Program
             }
             catch
             {
-                // ignore load failures - not relevant to this targeted search
+                // ignore load failures
             }
         }
 
-        using var w = new StreamWriter("dump.txt", false, Encoding.UTF8);
-        const BindingFlags instanceFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        Type target = allTypes.FirstOrDefault(t => t.FullName == fullTypeName || t.Name == fullTypeName);
 
-        // 1) CorpseRagdoll search + PlayerBody chain first - cheapest, and round 2 never reached
-        // this because it ran after the (crashing) deep recursion.
-        w.WriteLine("=== searching all loaded types for CorpseRagdoll's shape (fields _owner + _onRigidbodyStopped, or name containing 'Ragdoll') ===");
-        w.Flush();
-        foreach (var t in allTypes)
+        string result;
+        if (target == null)
         {
-            try
-            {
-                var fields = t.GetFields(instanceFlags);
-                bool hasOwner = fields.Any(f => f.Name == "_owner");
-                bool hasStoppedEvent = fields.Any(f => f.Name.IndexOf("onRigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0);
-                bool nameMatch = t.Name.IndexOf("Ragdoll", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                if ((hasOwner && hasStoppedEvent) || nameMatch)
-                {
-                    w.WriteLine("  candidate: " + t.FullName + " (hasOwner=" + hasOwner + ", hasStoppedEvent=" + hasStoppedEvent + ", nameMatch=" + nameMatch + ")");
-                    foreach (var f in fields)
-                    {
-                        w.WriteLine("    field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
-                    }
-
-                    var methods = SafeGet(() => t.GetMethods(instanceFlags));
-                    foreach (var m in methods.Where(m => m.Name == "Start" || m.Name.IndexOf("RigidbodyStopped", StringComparison.OrdinalIgnoreCase) >= 0))
-                    {
-                        w.WriteLine("    method: " + m + (m.IsPublic ? " [public]" : " [non-public]"));
-                    }
-                    w.Flush();
-                }
-            }
-            catch
-            {
-                // ignore - one bad type shouldn't stop the scan
-            }
-        }
-
-        // 2) PlayerBody's base type chain - confirms it inherits Component.TryGetComponent, which
-        // the CorpseRagdoll._owner.TryGetComponent<LocalPlayer>(...) call requires.
-        w.WriteLine();
-        w.WriteLine("=== EFT.PlayerBody base type chain ===");
-        Type playerBodyType = allTypes.FirstOrDefault(t => t.FullName == "EFT.PlayerBody");
-        if (playerBodyType == null)
-        {
-            w.WriteLine("  not found");
+            result = "NOT FOUND.";
         }
         else
         {
-            for (Type bt = playerBodyType; bt != null; bt = bt.BaseType)
-            {
-                w.WriteLine("  " + bt.FullName);
-            }
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+            MethodInfo[] methods = target.GetMethods(flags).Where(m => m.Name == methodName).ToArray();
+            result = methods.Length == 0
+                ? "METHOD NOT FOUND on this type."
+                : string.Join("\n", methods.Select(m => TryDecompile(target.Module.FullyQualifiedName, MetadataTokens.EntityHandle(m.MetadataToken))));
         }
-        w.Flush();
 
-        // Rounds 1-3 already answered CorpseRagdoll/PlayerBody/MongoID/InventoryDescriptorClass -
-        // removed from this round to keep output small. Round 4 targets the 3 new unknowns from
-        // the latest compile errors.
-
-        // 5) WaveInfoClass - the compile error already told us session.LoadBots wants
-        // List<WaveInfoClass> instead of 4.1's List<CountTypeBotWave>; need its ctor shape.
-        w.WriteLine("=== WaveInfoClass (replaces CountTypeBotWave) ===");
-        Type waveInfoType = allTypes.FirstOrDefault(t => t.Name == "WaveInfoClass");
-        if (waveInfoType == null)
-        {
-            w.WriteLine("  not found");
-        }
-        else
-        {
-            w.WriteLine("  FullName: " + waveInfoType.FullName);
-            foreach (var ctor in SafeGet(() => waveInfoType.GetConstructors(instanceFlags)))
-            {
-                var pars = SafeGet(() => ctor.GetParameters());
-                w.WriteLine("  ctor(" + string.Join(", ", pars.Select(p => SafeTypeName(p.ParameterType) + " " + p.Name)) + ")" + (ctor.IsPublic ? " [public]" : " [non-public]"));
-            }
-            foreach (var f in SafeGet(() => waveInfoType.GetFields(instanceFlags)))
-            {
-                w.WriteLine("  field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
-            }
-            foreach (var p in SafeGet(() => waveInfoType.GetProperties(instanceFlags)))
-            {
-                w.WriteLine("  prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
-            }
-        }
-        w.Flush();
-
-        // 6) EFT.InventoryLogic.EBoundItem's real enum member names - the Equipment guess was wrong.
-        w.WriteLine();
-        w.WriteLine("=== EFT.InventoryLogic.EBoundItem enum values ===");
-        Type eBoundItemType = allTypes.FirstOrDefault(t => t.FullName == "EFT.InventoryLogic.EBoundItem");
-        if (eBoundItemType == null)
-        {
-            w.WriteLine("  not found");
-        }
-        else
-        {
-            w.WriteLine("  " + string.Join(", ", Enum.GetNames(eBoundItemType)));
-        }
-        w.Flush();
-
-        // 7) TarkovApplication.HideoutControllerAccess's actual return type members - task_0
-        // doesn't exist on it (per the compile error), need whatever field/prop replaces it.
-        w.WriteLine();
-        w.WriteLine("=== TarkovApplication.HideoutControllerAccess return type members ===");
-        Type tarkovAppType = allTypes.FirstOrDefault(t => t.Name == "TarkovApplication");
-        if (tarkovAppType == null)
-        {
-            w.WriteLine("  TarkovApplication not found");
-        }
-        else
-        {
-            PropertyInfo hideoutControllerAccessProp = tarkovAppType.GetProperty("HideoutControllerAccess", instanceFlags | BindingFlags.FlattenHierarchy);
-            if (hideoutControllerAccessProp == null)
-            {
-                w.WriteLine("  HideoutControllerAccess property not found on TarkovApplication");
-            }
-            else
-            {
-                Type accessType = hideoutControllerAccessProp.PropertyType;
-                w.WriteLine("  HideoutControllerAccess : " + accessType.FullName);
-                foreach (var f in SafeGet(() => accessType.GetFields(instanceFlags)))
-                {
-                    w.WriteLine("    field: " + SafeTypeName(f.FieldType) + " " + f.Name + (f.IsPublic ? " [public]" : " [non-public]"));
-                }
-                foreach (var p in SafeGet(() => accessType.GetProperties(instanceFlags)))
-                {
-                    w.WriteLine("    prop: " + SafeTypeName(p.PropertyType) + " " + p.Name);
-                }
-            }
-        }
-        w.Flush();
-
-        Console.WriteLine("Wrote dump.txt");
+        File.WriteAllText(outFile, result, Encoding.UTF8);
     }
 
-    static T[] SafeGet<T>(Func<T[]> get)
+    static readonly Dictionary<string, CSharpDecompiler> _decompilerCache = new();
+
+    static CSharpDecompiler GetDecompiler(string dllPath)
     {
-        try { return get(); }
-        catch { return Array.Empty<T>(); }
+        if (_decompilerCache.TryGetValue(dllPath, out var cached))
+            return cached;
+
+        var mainModule = new PEFile(dllPath);
+        string targetFramework = mainModule.DetectTargetFrameworkId();
+
+        var resolver = new UniversalAssemblyResolver(dllPath, throwOnError: false, targetFramework);
+        resolver.AddSearchDirectory(ManagedDir);
+        if (Directory.Exists(BepInExCoreDir)) resolver.AddSearchDirectory(BepInExCoreDir);
+
+        var settings = new DecompilerSettings { ThrowOnAssemblyResolveErrors = false };
+        var decompiler = new CSharpDecompiler(mainModule, resolver, settings);
+        _decompilerCache[dllPath] = decompiler;
+        return decompiler;
     }
 
-    static string SafeTypeName(Type t)
+    static string TryDecompile(string dllPath, EntityHandle handle)
     {
-        if (t == null) return "null";
-        try { return t.ToString(); }
-        catch (Exception ex) { return "<?:" + ex.GetType().Name + ">"; }
+        try
+        {
+            return GetDecompiler(dllPath).DecompileAsString(new[] { handle });
+        }
+        catch (Exception ex)
+        {
+            return "  <decompile failed: " + ex + ">";
+        }
     }
 }
