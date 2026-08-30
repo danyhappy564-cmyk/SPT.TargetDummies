@@ -128,6 +128,22 @@ namespace SevenBoldPencil.TargetDummies
 
 		public Dictionary<LocalPlayer, MannequinData> Mannequins;
 
+		/// <summary>
+		/// The six fixed slots. Refresh rebuilds from this rather than from <see cref="Mannequins"/>,
+		/// which only ever holds the mannequins that are currently alive.
+		/// </summary>
+		private MannequinData[] _slots;
+
+		/// <summary>In-flight respawn coroutines, so a refresh can cancel them instead of racing.</summary>
+		private readonly List<Coroutine> _respawnRoutines = new();
+
+		/// <summary>
+		/// Bumped by every refresh. A respawn that started before the current generation belongs to
+		/// a slot the refresh has already refilled, so it must not spawn a second mannequin into it.
+		/// Backs up StopCoroutine, which cannot cancel a coroutine already past its last yield.
+		/// </summary>
+		private int _refreshGeneration;
+
         private void Awake()
         {
             Instance = this;
@@ -512,6 +528,28 @@ namespace SevenBoldPencil.TargetDummies
 			DestroyCorpse(profileId, position);
 		}
 
+		/// <summary>Destroys every corpse in the hideout - all of them are mannequins.</summary>
+		private void DestroyAllCorpses()
+		{
+			try
+			{
+				var gameWorld = Singleton<GameWorld>.Instance;
+				if (gameWorld?.LootList == null)
+				{
+					return;
+				}
+
+				foreach (var corpse in gameWorld.LootList.OfType<Corpse>().ToArray())
+				{
+					gameWorld.DestroyLoot(corpse);
+				}
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning($"Could not clear the corpses: {ex.GetType().Name}: {ex.Message}");
+			}
+		}
+
 		/// <summary>Destroys the corpse loot item a dead mannequin left in the world, if any.</summary>
 		private void DestroyCorpse(string profileId, Vector3? position)
 		{
@@ -583,8 +621,9 @@ namespace SevenBoldPencil.TargetDummies
 				}
 			}
 
-			// Fallback: the corpse dropped where the mannequin stood. Slots are metres apart, so a
-			// tight radius cannot pick up a neighbouring mannequin's body.
+			// Fallback: the corpse dropped where the mannequin stood. The two closest slots are
+			// 2.19m apart, so keep this well inside that - 1m - or one mannequin's despawn starts
+			// destroying its neighbour's body.
 			if (position == null)
 			{
 				return false;
@@ -593,7 +632,7 @@ namespace SevenBoldPencil.TargetDummies
 			try
 			{
 				return corpse.transform != null
-					&& (corpse.transform.position - position.Value).sqrMagnitude <= 4f;
+					&& (corpse.transform.position - position.Value).sqrMagnitude <= 1f;
 			}
 			catch
 			{
@@ -1647,23 +1686,42 @@ namespace SevenBoldPencil.TargetDummies
 		{
 			_refreshing = true;
 
-			// Snapshot first: despawning mutates Mannequins, and each slot has to be respawned from
-			// the same MannequinData it was using (its position and its row's pose).
-			var existing = Mannequins.ToArray();
-			foreach (var pair in existing)
+			// PORTING NOTE (SPT 4.0.13): rebuild from the fixed slot list, NOT from Mannequins.
+			// Mannequins only holds what is currently alive - OnBotDeath removes an entry the moment
+			// its mannequin dies - so refreshing off it silently skipped any slot that happened to
+			// be dead or mid-respawn, which is exactly the reported "press refresh while a body is
+			// down and the ones near it never come back".
+			//
+			// Any respawn already in flight has to be cancelled too, or it would spawn a second
+			// mannequin into a slot this routine is also filling.
+			_refreshGeneration++;
+
+			foreach (var routine in _respawnRoutines)
 			{
-				Mannequins.Remove(pair.Key);
+				if (routine != null)
+				{
+					StopCoroutine(routine);
+				}
+			}
+			_respawnRoutines.Clear();
 
-				DespawnMannequin(pair.Key);
-
+			foreach (var bot in Mannequins.Keys.ToArray())
+			{
+				Mannequins.Remove(bot);
+				DespawnMannequin(bot);
 				yield return null;
 			}
 
+			// Clear every remaining body. Corpses left by mannequins that were already dead are not
+			// covered by the despawn above, and a new mannequin spawned on top of one ends up inside
+			// it. In the shooting range every corpse is one of ours.
+			DestroyAllCorpses();
+
 			yield return new WaitForSeconds(SpawnInterval.Value);
 
-			foreach (var pair in existing)
+			foreach (var data in _slots ?? Array.Empty<MannequinData>())
 			{
-				yield return WaitForTaskOrTimeout(SpawnBot(pair.Value), 120f);
+				yield return WaitForTaskOrTimeout(SpawnBot(data), 120f);
 				yield return new WaitForSeconds(SpawnInterval.Value);
 			}
 
@@ -1699,7 +1757,9 @@ namespace SevenBoldPencil.TargetDummies
 			// a hard per-mannequin wall-clock cap here is the only way to guarantee one bad slot
 			// can't block the other 5 forever - the abandoned Task keeps running in the background
 			// and is simply never awaited past this point.
-			foreach (var data in new[] { closeLeft, closeMiddle, closeRight, farLeft, farMiddle, farRight })
+			_slots = new[] { closeLeft, closeMiddle, closeRight, farLeft, farMiddle, farRight };
+
+			foreach (var data in _slots)
 			{
 				yield return WaitForTaskOrTimeout(SpawnBot(data), 120f);
 				yield return new WaitForSeconds(SpawnInterval.Value);
@@ -1723,7 +1783,7 @@ namespace SevenBoldPencil.TargetDummies
 
 		public void OnBotDeath(LocalPlayer bot)
 		{
-			StartCoroutine(DespawnBotSpawnAnotherOne(bot));
+			_respawnRoutines.Add(StartCoroutine(DespawnBotSpawnAnotherOne(bot)));
 		}
 
 		public IEnumerator DespawnBotSpawnAnotherOne(LocalPlayer bot)
@@ -1732,6 +1792,8 @@ namespace SevenBoldPencil.TargetDummies
 			{
 				yield break;
 			}
+
+			int generation = _refreshGeneration;
 
 			// PORTING NOTE (SPT 4.0.13): this wait is deliberately NOT the spawn interval. It used to
 			// be, and that is what stopped kills producing blood: HollywoodFX attaches its gore to
@@ -1744,6 +1806,13 @@ namespace SevenBoldPencil.TargetDummies
 			DespawnMannequin(bot);
 
 			yield return new WaitForSeconds(SpawnInterval.Value);
+
+			// A refresh that happened while this was waiting has already refilled this slot.
+			if (generation != _refreshGeneration)
+			{
+				DebugLog("Skipping a respawn that a refresh superseded.");
+				yield break;
+			}
 
 			// Deliberately not awaited - a coroutine cannot await, and SpawnBot already handles its
 			// own failures. The discard is what says so to the compiler, instead of warning CS4014.
