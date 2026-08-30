@@ -112,7 +112,7 @@ namespace SevenBoldPencil.TargetDummies
 		public ConfigEntry<bool> SpawnUnarmored;
 		public ConfigEntry<bool> ForceWeaponLightsOff;
 		public ConfigEntry<float> SpawnInterval;
-		public ConfigEntry<float> CorpseLinger;
+		public ConfigEntry<float> RespawnDelay;
 		public ConfigEntry<string> FallbackMeleeTemplateId;
 
 		public ConfigEntry<KeyboardShortcut> RefreshHotkey;
@@ -177,15 +177,17 @@ namespace SevenBoldPencil.TargetDummies
 				null, new ConfigurationManagerAttributes { Order = 7 }));
 
 			SpawnInterval = Config.Bind<float>("Mannequin Settings", "Spawn Interval", 0.5f, new ConfigDescription(
-				"Seconds to wait between spawning one mannequin and the next, and before a killed mannequin respawns. "
-				+ "Lower is faster but spawns more work into a single frame.",
-				new AcceptableValueRange<float>(0.1f, 5f), new ConfigurationManagerAttributes { Order = 6 }));
+				"Seconds between one mannequin and the next when all six are being spawned at once - entering the "
+				+ "shooting range, or pressing Refresh. Does not affect respawns after a kill; that is Respawn Delay. "
+				+ "Lower is faster but packs more work into a single frame.",
+				new AcceptableValueRange<float>(0.1f, 3f), new ConfigurationManagerAttributes { Order = 6 }));
 
-			CorpseLinger = Config.Bind<float>("Mannequin Settings", "Corpse Linger", 5f, new ConfigDescription(
-				"Seconds a body stays before it is removed and respawned. HollywoodFX waits for the ragdoll to "
-				+ "come to rest before it plays its blood and gore, so removing the body too early cuts the "
-				+ "effect off entirely. Raise this if kills stop producing blood.",
-				new AcceptableValueRange<float>(0.5f, 30f), new ConfigurationManagerAttributes { Order = 8 }));
+			RespawnDelay = Config.Bind<float>("Mannequin Settings", "Respawn Delay", 5f, new ConfigDescription(
+				"Seconds from a mannequin dying to its replacement appearing. The body lies there for this whole "
+				+ "time, so it also decides how long you get to look at the corpse. The lower bound is 2s on "
+				+ "purpose: HollywoodFX waits for the ragdoll to settle before playing its blood, so clearing the "
+				+ "body sooner than that cuts the effect off before it starts.",
+				new AcceptableValueRange<float>(2f, 30f), new ConfigurationManagerAttributes { Order = 8 }));
 
 			FallbackMeleeTemplateId = Config.Bind<string>("Mannequin Settings", "Fallback Melee Template Id", "54491bb74bdc2d09088b4567", new ConfigDescription(
 				"Item template id given to an unarmored mannequin when you are not carrying a melee weapon yourself. "
@@ -1458,17 +1460,20 @@ namespace SevenBoldPencil.TargetDummies
 
 			int generation = _refreshGeneration;
 
-			// PORTING NOTE (SPT 4.0.13): this wait is deliberately NOT the spawn interval. It used to
-			// be, and that is what stopped kills producing blood: HollywoodFX attaches its gore to
-			// the ragdoll from a prefix on RagdollClass.Start (confirmed by dumping its assembly -
-			// RagdollStartPrefixPatch), so disposing the body promptly cut the effect off before it
-			// could play. Lowering the spawn interval to speed spawns up therefore silently killed
-			// the death effects. The corpse now has its own, separately bounded timing.
-			yield return new WaitForSeconds(CorpseLinger.Value);
+			// PORTING NOTE (SPT 4.0.13): the body has to stay put for a while. HollywoodFX attaches
+			// its gore to the ragdoll from a prefix on RagdollClass.Start (confirmed by dumping its
+			// assembly - RagdollStartPrefixPatch) and waits for the ragdoll to settle before playing
+			// it, so clearing the body promptly cuts the effect off before it starts. This used to
+			// share the spawn-interval setting, which meant turning spawns up silently killed the
+			// death effects; respawn timing is now its own setting with a 2s floor.
+			yield return new WaitForSeconds(RespawnDelay.Value);
 
 			DespawnMannequin(bot);
 
-			yield return new WaitForSeconds(SpawnInterval.Value);
+			// A short fixed beat so the body is fully gone before its replacement is built on the
+			// same spot. Not configurable - there is no reason to tune it, and letting it reach zero
+			// only reintroduces spawning into a corpse.
+			yield return new WaitForSeconds(0.25f);
 
 			// A refresh that happened while this was waiting has already refilled this slot.
 			if (generation != _refreshGeneration)
